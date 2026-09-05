@@ -1083,8 +1083,20 @@ class CommunicationIngestionPipeline:
             logger.debug(f"Could not persist poll fetch state: {e}")
 
     def _ensure_seen_ids_loaded(self) -> None:
-        """One-time seed of the dedup set from what's already in the store, so
-        a fresh state file (or a wiped cursor) can't re-add existing rows."""
+        """One-time seed of the dedup set from what's actually in the store.
+
+        The durable store is authoritative. The state file's seen-id list can
+        outlive the rows it refers to (table rebuild after the Aug 2026
+        21k-duplicate-row cleanup, the root-vs-backend memory-store fork) —
+        trusting those ghost ids permanently blocked re-ingestion of ~5,900
+        fetched-but-unstored emails (Sep 2026: 'only 50 emails ingested',
+        agent could not find existing threads). So the seen set is REPLACED
+        with store ids; any state-file id without a row is a ghost and is
+        dropped. On mass loss the per-app cursors are cleared too — the
+        cursors have already advanced past the lost range, and only a fresh
+        window walk can re-fetch it (dedup against store ids keeps the
+        re-walk duplication-free).
+        """
         if self._seen_ids_loaded:
             return
         self._seen_ids_loaded = True
@@ -1094,12 +1106,23 @@ class CommunicationIngestionPipeline:
             table = self.memory_manager.connections_table
             if table is not None:
                 ids = table.to_arrow().select(["id"]).to_pylist()
-                self._seen_message_ids.update(
-                    str(r["id"]) for r in ids if r.get("id")
-                )
-                logger.info(
-                    f"Loaded {len(self._seen_message_ids)} known message ids for poll dedup"
-                )
+                store_ids = {str(r["id"]) for r in ids if r.get("id")}
+                before = len(self._seen_message_ids)
+                self._seen_message_ids = store_ids
+                lost = before - len(self._seen_message_ids)
+                if lost > 0:
+                    logger.warning(
+                        f"Dropped {lost} seen-id ghosts not present in the "
+                        "store (state file outlived its rows) — those "
+                        "messages are eligible for re-ingestion"
+                    )
+                    if lost >= 100:
+                        logger.warning(
+                            f"Mass seen-id loss ({lost}); clearing poll "
+                            "cursors so the fetch windows are re-walked and "
+                            "the lost range is re-ingested"
+                        )
+                        self.fetch_timestamps.clear()
         except Exception as e:
             logger.debug(f"seen-id seeding skipped: {e}")
 
@@ -1444,12 +1467,32 @@ class CommunicationIngestionPipeline:
                 if new_messages:
                     logger.info(f"Fetched {len(new_messages)} new messages from {app_type}")
 
-                    # Ingest each message
+                    # Ingest each message; an id joins the seen set only
+                    # after a successful ingest, so a failed write is
+                    # retried on the next poll instead of being lost.
+                    ingested = 0
                     for message in new_messages:
                         try:
-                            await self.ingest_message(app_type, message)
+                            success = await self.ingest_message(app_type, message)
                         except Exception as e:
                             logger.error(f"Failed to ingest message from {app_type}: {e}")
+                            success = False
+                        if success:
+                            ingested += 1
+                            message_id = str(message.get("id") or "")
+                            if message_id:
+                                self._seen_message_ids.add(message_id)
+                        else:
+                            logger.warning(
+                                f"Ingest failed for {app_type} message "
+                                f"{message.get('id')} — will retry next poll"
+                            )
+                    if ingested < len(new_messages):
+                        logger.warning(
+                            f"Ingested {ingested}/{len(new_messages)} fetched "
+                            f"{app_type} messages; remainder will be retried"
+                        )
+                    self._save_fetch_state()
 
                 # Land accumulated stats once per cycle (not per message)
                 await asyncio.to_thread(self.memory_manager._flush_metadata)
@@ -1499,14 +1542,18 @@ class CommunicationIngestionPipeline:
             # Re-fetch guard: drop messages already ingested. A cold cursor
             # (fresh state file, wiped table, or clock overlap) used to mean
             # the newest page was re-added in full on every restart.
+            #
+            # IDs are NOT marked seen here — only after a successful ingest
+            # (see _real_time_ingestion). Marking at fetch time permanently
+            # lost any message whose ingest failed or was dropped: the id was
+            # in the seen set, the row never was, and no later poll would
+            # retry it (~5,900 emails lost that way before Sep 2026).
             self._ensure_seen_ids_loaded()
             fresh: List[Dict[str, Any]] = []
             for message in messages:
                 message_id = str(message.get("id") or "")
                 if message_id and message_id in self._seen_message_ids:
                     continue
-                if message_id:
-                    self._seen_message_ids.add(message_id)
                 fresh.append(message)
             if len(fresh) < len(messages):
                 logger.info(
@@ -3358,9 +3405,24 @@ def get_memory_manager(workspace_id: Optional[str] = None) -> LanceDBMemoryManag
 memory_manager = get_memory_manager()
 
 def get_ingestion_pipeline(workspace_id: Optional[str] = None) -> CommunicationIngestionPipeline:
-    """Get workspace-aware ingestion pipeline"""
-    mgr = get_memory_manager(workspace_id)
-    return CommunicationIngestionPipeline(mgr)
+    """Get workspace-aware ingestion pipeline.
+
+    One instance per workspace, process-wide. The pipeline carries poller
+    state (fetch cursors, seen-id set, a running poller task) — a fresh
+    instance per call meant two pollers could run against the same
+    poll_fetch_state.json, each re-saving its own snapshot and reverting the
+    other's cursor progress (Sep 2026: the seen-id-ghost heal kept being
+    undone by the second instance's stale cursors).
+    """
+    ws_id = workspace_id or "default"
+    existing = _pipeline_instances.get(ws_id)
+    if existing is None:
+        existing = CommunicationIngestionPipeline(get_memory_manager(ws_id))
+        _pipeline_instances[ws_id] = existing
+    return existing
+
+
+_pipeline_instances: Dict[str, CommunicationIngestionPipeline] = {}
 
 ingestion_pipeline = get_ingestion_pipeline()
 
