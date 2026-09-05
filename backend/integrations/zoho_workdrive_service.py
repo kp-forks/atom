@@ -31,8 +31,11 @@ class ZohoWorkDriveService(IntegrationService):
     _MIN_API_INTERVAL_SECONDS = 0.35
     _MAX_429_RETRIES = 4
     # Global caps for client-triggered recursive traversal — bound request
-    # latency and upstream API calls on large drives.
-    MAX_RECURSIVE_ITEMS = 2000
+    # latency and upstream API calls on large drives. 2026-09-05: 2000
+    # truncated real ingestion (4 team folders, 2000+ files — docs past the
+    # cap were never discovered); raised to match MAX_LIST_ITEMS' 10k budget.
+    # Pacing above (~3 req/s) keeps the larger walk under API throttle.
+    MAX_RECURSIVE_ITEMS = 10000
     MAX_TREE_NODES = 1000
 
     def __init__(self, tenant_id: str = "default", config: Dict[str, Any] = None):

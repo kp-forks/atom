@@ -53,6 +53,17 @@ if [ -f "$DB_PATH" ]; then
     fi
 fi
 
+# External-store preflight: the LanceDB memory store lives on the portable
+# drive via symlink. Booting with the drive absent means "healthy but
+# memory-less" — warn loudly BEFORE starting, with recovery steps.
+MEM_LINK="$BACKEND_DIR/data/atom_memory"
+if [ -L "$MEM_LINK" ] && [ ! -e "$MEM_LINK" ]; then
+    echo "!! WARNING: external memory store not mounted ($MEM_LINK dangling)."
+    echo "!!   The API will start, but memory/RAG features will error until"
+    echo "!!   the drive is reconnected (recovery is automatic afterwards)."
+    echo "!!   Diagnose with scripts/drive_status.sh"
+fi
+
 echo "==> Stopping existing backend instance(s) on port $PORT"
 pkill -f "uvicorn main_api_app:app" 2>/dev/null
 sleep 2

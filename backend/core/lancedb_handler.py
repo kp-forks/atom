@@ -240,6 +240,26 @@ class LanceDBHandler:
             # Handle local path creation
             if not self.db_path.startswith("s3://"):
                 self.db_path = os.path.abspath(self.db_path)
+                # Dangling-symlink probe (2026-09-05): the memory store may
+                # live on the portable drive via symlink — if the drive is
+                # unplugged, os.makedirs below fails with a cryptic ENOENT.
+                # Fail with recovery instructions instead; db stays None so
+                # the next call retries automatically once the drive is back.
+                _probe = self.db_path
+                while _probe != os.path.dirname(_probe):
+                    if os.path.islink(_probe) and not os.path.exists(_probe):
+                        logger.error(
+                            "LanceDB store %s is a DANGLING SYMLINK — external "
+                            "drive not mounted. Memory features are disabled "
+                            "until the drive is reconnected (then retry "
+                            "automatically). Run scripts/drive_status.sh to "
+                            "diagnose; data is NOT lost (it lives on the "
+                            "drive).", _probe,
+                        )
+                        raise FileNotFoundError(
+                            f"External memory store not mounted: {_probe}"
+                        )
+                    _probe = os.path.dirname(_probe)
                 os.makedirs(self.db_path, exist_ok=True)
 
             # Connect to database with storage options (required for R2/S3 endpoints)
