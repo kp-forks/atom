@@ -24,7 +24,7 @@ class ZohoWorkDriveService(IntegrationService):
     """
 
     PAGE_SIZE = 50
-    MAX_LIST_ITEMS = 10000
+    MAX_LIST_ITEMS = int(os.getenv("WORKDRIVE_MAX_LIST_ITEMS", "100000"))
     MAX_WALK_DEPTH = 25
     # Pacing/backoff for the Zoho REST API (see _zoho_get). ~3 req/s keeps a
     # full-tree walk under Zoho's per-DC throttle instead of 429ing it.
@@ -33,10 +33,11 @@ class ZohoWorkDriveService(IntegrationService):
     # Global caps for client-triggered recursive traversal — bound request
     # latency and upstream API calls on large drives. 2026-09-05: 2000
     # truncated real ingestion (4 team folders, 2000+ files — docs past the
-    # cap were never discovered); raised to match MAX_LIST_ITEMS' 10k budget.
-    # Pacing above (~3 req/s) keeps the larger walk under API throttle.
-    MAX_RECURSIVE_ITEMS = 10000
-    MAX_TREE_NODES = 1000
+    # cap were never discovered). Defaults now target TB-scale drives
+    # (1M items ≈ 20k API pages ≈ 2-3h of paced walking); override via env
+    # (e.g. WORKDRIVE_MAX_RECURSIVE_ITEMS=5000000) without code changes.
+    MAX_RECURSIVE_ITEMS = int(os.getenv("WORKDRIVE_MAX_RECURSIVE_ITEMS", "1000000"))
+    MAX_TREE_NODES = int(os.getenv("WORKDRIVE_MAX_TREE_NODES", "100000"))
 
     def __init__(self, tenant_id: str = "default", config: Dict[str, Any] = None):
         if config is None:
@@ -575,7 +576,15 @@ class ZohoWorkDriveService(IntegrationService):
                         subfiles = await self.list_files(
                             user_id, parent_id=f["id"], recursive=True
                         )
+                        prev = len(all_files)
                         all_files.extend(subfiles)
+                        # Progress heartbeat: TB-scale walks run for hours at
+                        # the paced ~3 req/s — surface them in the log.
+                        if len(all_files) // 10000 > prev // 10000:
+                            logger.info(
+                                "WorkDrive recursive walk progress: %s items discovered",
+                                len(all_files),
+                            )
                 return all_files
 
             return files
