@@ -1010,6 +1010,18 @@ def parse_message_timestamp(message_data: Dict[str, Any]) -> datetime:
     return datetime.now()
 
 
+def _message_owner_stamp(message_data: Dict[str, Any]) -> str:
+    """The owner a message record is/would be stamped with ("" = unstamped).
+
+    Mirrors what the normalizer stores in metadata.user_id — the poller
+    stamps the mailbox owner there so ownership-scoped search can enforce
+    the per-account boundary."""
+    md = message_data.get("metadata")
+    if isinstance(md, dict):
+        return str(md.get("user_id") or "")
+    return ""
+
+
 class CommunicationIngestionPipeline:
     """Main ingestion pipeline for all communication apps"""
     
@@ -1022,16 +1034,18 @@ class CommunicationIngestionPipeline:
         self.webhook_enabled = {}  # Track which apps have webhooks enabled
 
         # Poll dedup state: persisted cursors + known message ids, tracked
-        # PER APP. The cursor used to be memory-only, so every restart
+        # PER APP as id -> owner ("" = unstamped row, visible to every
+        # owner). The cursor used to be memory-only, so every restart
         # re-fetched the newest page and re-added it — one table on this dev
         # machine grew to 21k duplicate rows / 20GB of Lance version
-        # manifests (Aug 2026). Per-app tracking (not one flat set) lets the
-        # store reconciliation attribute ghost ids — fetched-but-unstored
-        # messages — to the right app and re-walk only that app's window
-        # (Sep 2026: ~5.9k outlook emails were lost to app-agnostic ghost
-        # ids; the heal must never hold unrelated apps' cursors hostage).
-        self._seen_message_ids: Dict[str, Set[str]] = {}
-        # The set is mutated from the event loop (poller) and from worker
+        # manifests (Aug 2026). Owner attribution matters: rows stamped with
+        # a user_id that no longer exists (the 2026-09-04 live-DB wipe left
+        # the Lance store full of dead-owner stamps) must NOT shadow
+        # re-ingestion for the live owner — the agent's search is
+        # ownership-scoped, so dead-stamped rows are invisible and only a
+        # fresh ingest under the live stamp makes mail findable again.
+        self._seen_message_ids: Dict[str, Dict[str, str]] = {}
+        # The map is mutated from the event loop (poller) and from worker
         # threads (maintenance-loop reconciliation) — serialize access.
         self._seen_state_lock = threading.RLock()
         self._seen_ids_loaded = False
@@ -1059,7 +1073,7 @@ class CommunicationIngestionPipeline:
             logger.warning("Webhook handlers not available, real-time ingestion disabled")
 
     def _load_fetch_state(self) -> None:
-        """Restore fetch cursors + per-app seen message ids across restarts."""
+        """Restore fetch cursors + per-app, per-owner seen message ids."""
         try:
             if self._fetch_state_path.exists():
                 data = json.loads(self._fetch_state_path.read_text() or "{}")
@@ -1068,41 +1082,48 @@ class CommunicationIngestionPipeline:
                         self.fetch_timestamps[key] = datetime.fromisoformat(ts)
                     except Exception:
                         continue
-                by_app = data.get("seen_message_ids_by_app") or {}
+                by_owner = data.get("seen_message_ids_by_owner") or {}
                 self._seen_message_ids = {
-                    str(app): {str(i) for i in ids}
-                    for app, ids in by_app.items()
-                    if isinstance(ids, list)
+                    str(app): {
+                        str(i): str(owner)
+                        for owner, ids in per_app.items()
+                        if isinstance(ids, list)
+                        for i in ids
+                    }
+                    for app, per_app in by_owner.items()
+                    if isinstance(per_app, dict)
                 }
-                if data.get("seen_message_ids"):
-                    # Legacy flat list (pre per-app format): ids can't be
-                    # attributed to an app, so they are discarded — the boot
-                    # reconciliation re-seeds the set from the durable store,
-                    # which is authoritative anyway.
+                if data.get("seen_message_ids") or data.get("seen_message_ids_by_app"):
+                    # Legacy formats (flat list / per-app without owner
+                    # attribution): ids can't be attributed to an owner, so
+                    # they are discarded — the boot reconciliation re-seeds
+                    # from the durable store, which is authoritative.
                     logger.info(
-                        "Ignored legacy flat seen-id list in poll fetch "
-                        "state; store reconciliation re-seeds it"
+                        "Ignored legacy seen-id list in poll fetch state; "
+                        "store reconciliation re-seeds it"
                     )
                 logger.info(
                     f"Restored poll fetch state: {len(self.fetch_timestamps)} cursors, "
-                    f"{sum(len(s) for s in self._seen_message_ids.values())} known "
+                    f"{sum(len(m) for m in self._seen_message_ids.values())} known "
                     f"message ids across {len(self._seen_message_ids)} app(s)"
                 )
         except Exception as e:
             logger.warning(f"Could not restore poll fetch state: {e}")
 
     def _save_fetch_state(self) -> None:
-        """Persist fetch cursors + bounded per-app seen-id sets (atomic write)."""
+        """Persist fetch cursors + bounded per-owner seen-id map (atomic write)."""
         try:
+            by_owner: Dict[str, Dict[str, List[str]]] = {}
+            for app, id_owner in self._seen_message_ids.items():
+                for message_id, owner in id_owner.items():
+                    per = by_owner.setdefault(app, {}).setdefault(owner, [])
+                    if len(per) < 20000:
+                        per.append(message_id)
             payload = {
                 "fetch_timestamps": {
                     k: v.isoformat() for k, v in self.fetch_timestamps.items()
                 },
-                "seen_message_ids_by_app": {
-                    app: list(ids)[-20000:]
-                    for app, ids in self._seen_message_ids.items()
-                    if ids
-                },
+                "seen_message_ids_by_owner": by_owner,
             }
             tmp = self._fetch_state_path.with_suffix(".tmp")
             tmp.write_text(json.dumps(payload))
@@ -1129,9 +1150,9 @@ class CommunicationIngestionPipeline:
         return len(doomed)
 
     def _reconcile_seen_ids_with_store(self) -> Dict[str, int]:
-        """Self-heal the poll dedup set against the durable store (all apps).
+        """Self-heal the poll dedup map against the durable store (all apps).
 
-        The seen-id set is a CACHE of what's in the store, never an
+        The seen-id map is a CACHE of what's in the store, never an
         authority. The state file can outlive its rows (table rebuild after
         the Aug 2026 21k-duplicate-row cleanup, the root-vs-backend
         memory-store fork, a wiped workspace) — trusting those ghost ids
@@ -1139,12 +1160,13 @@ class CommunicationIngestionPipeline:
         outlook emails (Sep 2026: 'only 50 emails ingested', the agent could
         not find threads that existed in the mailbox).
 
-        Reconciliation: the per-app seen sets are REPLACED with the ids
-        actually in the store; the difference is reported per app as ghosts.
-        When an app's ghost count crosses SEEN_GHOST_CURSOR_CLEAR_THRESHOLD,
-        that app's cursors are cleared so only ITS window is re-walked —
-        other apps' cursors are untouched. Re-seeding from store ids keeps
-        the re-walk duplication-free.
+        Reconciliation: the per-app id->owner map is REPLACED with the ids
+        actually in the store (owner read from metadata.user_id, "" when
+        unstamped); the difference is reported per app as ghosts. When an
+        app's ghost count crosses SEEN_GHOST_CURSOR_CLEAR_THRESHOLD, that
+        app's cursors are cleared so only ITS window is re-walked — other
+        apps' cursors are untouched. Re-seeding from store ids keeps the
+        re-walk duplication-free.
 
         Runs at poller boot (_ensure_seen_ids_loaded) and periodically from
         the maintenance loop, so a store rebuilt even mid-process heals on
@@ -1156,25 +1178,32 @@ class CommunicationIngestionPipeline:
         table = self.memory_manager.connections_table
         if table is None:
             return {}
-        rows = table.to_arrow().select(["id", "app_type"]).to_pylist()
-        store_by_app: Dict[str, Set[str]] = {}
+        rows = table.to_arrow().select(["id", "app_type", "metadata"]).to_pylist()
+        store_by_app: Dict[str, Dict[str, str]] = {}
         for r in rows:
             if not r.get("id"):
                 continue
             app = str(r.get("app_type") or "")
-            store_by_app.setdefault(app, set()).add(str(r["id"]))
+            owner = ""
+            md = r.get("metadata")
+            if md:
+                try:
+                    parsed = json.loads(md) if isinstance(md, (str, bytes)) else md
+                    owner = str((parsed or {}).get("user_id") or "")
+                except Exception:
+                    owner = ""
+            store_by_app.setdefault(app, {})[str(r["id"])] = owner
 
         report: Dict[str, int] = {}
         with self._seen_state_lock:
-            apps = set(self._seen_message_ids) | set(store_by_app)
-            for app in apps:
-                store_ids = store_by_app.get(app, set())
-                old = self._seen_message_ids.get(app, set())
-                ghosts = len(old - store_ids)
+            for app in set(self._seen_message_ids) | set(store_by_app):
+                store_map = store_by_app.get(app, {})
+                old_map = self._seen_message_ids.get(app, {})
+                ghosts = len(set(old_map) - set(store_map))
                 # Replace (not just intersect): the store is authoritative,
                 # so ids the state file is missing are seeded back too —
                 # a stored row must never be re-ingested by a window walk.
-                self._seen_message_ids[app] = set(store_ids)
+                self._seen_message_ids[app] = dict(store_map)
                 if ghosts:
                     report[app] = ghosts
                     logger.warning(
@@ -1420,7 +1449,9 @@ class CommunicationIngestionPipeline:
             # id (the normalizer would mint a fresh timestamp id) can't be
             # deduped here and are left to the caller to make idempotent.
             message_id = str(message_data.get("id") or "")
-            if message_id and self.is_message_known(app_type, message_id):
+            if message_id and self.is_message_known(
+                app_type, message_id, owner=_message_owner_stamp(message_data)
+            ):
                 logger.debug(f"Webhook message {message_id} already ingested ({app_type})")
                 return
 
@@ -1432,7 +1463,9 @@ class CommunicationIngestionPipeline:
                 # Mark only after the store write succeeded (mark-after-
                 # success contract — see _ingest_and_mark).
                 if message_id:
-                    self.mark_message_ingested(app_type, message_id)
+                    self.mark_message_ingested(
+                        app_type, message_id, owner=_message_owner_stamp(message_data)
+                    )
                 logger.info(f"Successfully ingested webhook message from {app_type}")
             else:
                 logger.error(f"Failed to ingest webhook message from {app_type}")
@@ -1585,7 +1618,7 @@ class CommunicationIngestionPipeline:
                 logger.error(f"Error in real-time ingestion for {app_type}: {str(e)}")
                 await asyncio.sleep(60)  # Wait longer on error
 
-    def is_message_known(self, app_type: str, message_id: str) -> bool:
+    def is_message_known(self, app_type: str, message_id: str, owner: str = "") -> bool:
         """True if a message id is already recorded for this app.
 
         The seen-id cache is reconciled against the durable store at boot and
@@ -1601,16 +1634,22 @@ class CommunicationIngestionPipeline:
             return False
         self._ensure_seen_ids_loaded()
         with self._seen_state_lock:
-            return message_id in self._seen_message_ids.get(app_type, set())
+            id_owner = self._seen_message_ids.get(app_type, {}).get(message_id)
+        # An unstamped stored row ("") is visible to every owner; a row
+        # stamped for a DIFFERENT owner is not (ownership-scoped search), so
+        # it must not block this owner's ingest.
+        return id_owner is not None and id_owner in ("", owner)
 
-    def mark_message_ingested(self, app_type: str, message_id: str) -> None:
+    def mark_message_ingested(
+        self, app_type: str, message_id: str, owner: str = ""
+    ) -> None:
         """Record a message id as ingested (call only after a successful
         store write — a pre-marked id that never landed in the store is
         exactly the ghost-id data-loss mode this pipeline healed from)."""
         if not message_id:
             return
         with self._seen_state_lock:
-            self._seen_message_ids.setdefault(app_type, set()).add(message_id)
+            self._seen_message_ids.setdefault(app_type, {})[message_id] = str(owner or "")
 
     async def _ingest_and_mark(self, app_type: str, messages: List[Dict[str, Any]]) -> None:
         """Ingest fetched messages and record their ids as seen ONLY on
@@ -1631,7 +1670,9 @@ class CommunicationIngestionPipeline:
                 message_id = str(message.get("id") or "")
                 if message_id:
                     with self._seen_state_lock:
-                        self._seen_message_ids.setdefault(app_type, set()).add(message_id)
+                        self._seen_message_ids.setdefault(app_type, {})[message_id] = (
+                            _message_owner_stamp(message)
+                        )
             else:
                 logger.warning(
                     f"Ingest failed for {app_type} message "
@@ -1643,6 +1684,30 @@ class CommunicationIngestionPipeline:
                 f"{app_type} messages; remainder will be retried"
             )
         self._save_fetch_state()
+
+    def _dedup_messages(
+        self, app_type: str, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Re-fetch guard: drop messages already ingested under the SAME
+        owner's stamp (or as unstamped rows, which ownership-scoped search
+        shows to every owner). A row stamped for a DIFFERENT owner never
+        blocks an ingest — search is ownership-scoped, so dead-owner rows
+        are invisible and the live owner needs its own copy."""
+        self._ensure_seen_ids_loaded()
+        fresh: List[Dict[str, Any]] = []
+        with self._seen_state_lock:
+            known_for_app = self._seen_message_ids.setdefault(app_type, {})
+            for message in messages:
+                message_id = str(message.get("id") or "")
+                if not message_id:
+                    fresh.append(message)
+                    continue
+                stamp = _message_owner_stamp(message)
+                id_owner = known_for_app.get(message_id)
+                if id_owner is not None and id_owner in ("", stamp):
+                    continue
+                fresh.append(message)
+        return fresh
 
     async def _fetch_new_messages(self, app_type: str) -> List[Dict[str, Any]]:
         """
@@ -1684,19 +1749,11 @@ class CommunicationIngestionPipeline:
             # the newest page was re-added in full on every restart.
             #
             # IDs are NOT marked seen here — only after a successful ingest
-            # (see _real_time_ingestion). Marking at fetch time permanently
+            # (see _ingest_and_mark). Marking at fetch time permanently
             # lost any message whose ingest failed or was dropped: the id was
             # in the seen set, the row never was, and no later poll would
             # retry it (~5,900 emails lost that way before Sep 2026).
-            self._ensure_seen_ids_loaded()
-            fresh: List[Dict[str, Any]] = []
-            with self._seen_state_lock:
-                seen_for_app = self._seen_message_ids.setdefault(app_type, set())
-                for message in messages:
-                    message_id = str(message.get("id") or "")
-                    if message_id and message_id in seen_for_app:
-                        continue
-                    fresh.append(message)
+            fresh = self._dedup_messages(app_type, messages)
             if len(fresh) < len(messages):
                 logger.info(
                     f"Skipped {len(messages) - len(fresh)} already-ingested "

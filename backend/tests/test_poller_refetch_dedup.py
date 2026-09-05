@@ -137,14 +137,14 @@ class TestRefetchDedup:
 
     def test_seen_ids_bounded_in_state_file(self, pipeline):
         pipeline._seen_message_ids = {
-            "outlook": {f"id-{i}" for i in range(25000)},
-            "slack": {"s-1"},
+            "outlook": {f"id-{i}": "" for i in range(25000)},
+            "slack": {"s-1": ""},
         }
         pipeline.fetch_timestamps["last_fetch_outlook"] = datetime.now()
         pipeline._save_fetch_state()
         data = json.loads(pipeline._fetch_state_path.read_text())
-        assert len(data["seen_message_ids_by_app"]["outlook"]) <= 20000
-        assert data["seen_message_ids_by_app"]["slack"] == ["s-1"]
+        assert len(data["seen_message_ids_by_owner"]["outlook"][""]) <= 20000
+        assert data["seen_message_ids_by_owner"]["slack"][""] == ["s-1"]
 
 
 class TestStoreReconciliationSelfHeal:
@@ -173,20 +173,20 @@ class TestStoreReconciliationSelfHeal:
             ],
         )
         pipeline._seen_message_ids = {
-            "outlook": {"stored-1", "ghost-1", "ghost-2"},
-            "slack": {"stored-2", "ghost-3"},
+            "outlook": {"stored-1": "", "ghost-1": "", "ghost-2": ""},
+            "slack": {"stored-2": "", "ghost-3": ""},
         }
         report = pipeline._reconcile_seen_ids_with_store()
 
         assert report == {"outlook": 2, "slack": 1}
-        assert pipeline._seen_message_ids["outlook"] == {"stored-1"}
-        assert pipeline._seen_message_ids["slack"] == {"stored-2"}
+        assert pipeline._seen_message_ids["outlook"] == {"stored-1": ""}
+        assert pipeline._seen_message_ids["slack"] == {"stored-2": ""}
 
     def test_mass_loss_clears_only_affected_app_cursors(self, pipeline):
         self._with_store(pipeline, [{"id": "s-1", "app_type": "slack"}])
         pipeline._seen_message_ids = {
-            "outlook": {f"ghost-{i}" for i in range(100)},
-            "slack": {"s-1"},
+            "outlook": {f"ghost-{i}": "" for i in range(100)},
+            "slack": {"s-1": ""},
         }
         pipeline.fetch_timestamps.update(
             {
@@ -207,20 +207,20 @@ class TestStoreReconciliationSelfHeal:
 
     def test_small_ghost_count_keeps_cursors(self, pipeline):
         self._with_store(pipeline, [{"id": "s-1", "app_type": "slack"}])
-        pipeline._seen_message_ids = {"slack": {"s-1", "ghost-1", "ghost-2"}}
+        pipeline._seen_message_ids = {"slack": {"s-1": "", "ghost-1": "", "ghost-2": ""}}
         pipeline.fetch_timestamps["last_fetch_slack"] = datetime(2026, 8, 1)
         pipeline._reconcile_seen_ids_with_store()
         assert pipeline.fetch_timestamps["last_fetch_slack"] == datetime(2026, 8, 1)
 
     def test_state_file_roundtrip_per_app(self, pipeline):
         self._with_store(pipeline, [{"id": "s-1", "app_type": "slack"}])
-        pipeline._seen_message_ids = {"slack": {"s-1"}}
+        pipeline._seen_message_ids = {"slack": {"s-1": ""}}
         pipeline.fetch_timestamps["last_fetch_slack"] = datetime(2026, 8, 1)
         pipeline._save_fetch_state()
         restarted = CommunicationIngestionPipeline(
             memory_manager=pipeline.memory_manager
         )
-        assert restarted._seen_message_ids == {"slack": {"s-1"}}
+        assert restarted._seen_message_ids == {"slack": {"s-1": ""}}
         assert restarted.fetch_timestamps["last_fetch_slack"] == datetime(2026, 8, 1)
 
     def test_legacy_flat_state_file_is_ignored_not_crashed(self, pipeline):
@@ -231,6 +231,48 @@ class TestStoreReconciliationSelfHeal:
             memory_manager=pipeline.memory_manager
         )
         assert restarted._seen_message_ids == {}
+
+    def test_dead_owner_stamp_does_not_shadow_live_owner(self, pipeline):
+        """Rows stamped with a dead user id (DB wipe left the Lance store
+        full of them) are invisible to the live owner's scoped search — so
+        they must not block re-ingestion under the live owner's stamp."""
+        self._with_store(
+            pipeline,
+            [
+                {
+                    "id": "m-1",
+                    "app_type": "outlook",
+                    "metadata": json.dumps({"user_id": "dead-owner"}),
+                },
+                {
+                    "id": "m-2",
+                    "app_type": "outlook",
+                    "metadata": json.dumps({"user_id": "live-owner"}),
+                },
+                {"id": "m-3", "app_type": "outlook"},  # unstamped: global
+            ],
+        )
+        pipeline._reconcile_seen_ids_with_store()
+        assert pipeline._seen_message_ids["outlook"] == {
+            "m-1": "dead-owner",
+            "m-2": "live-owner",
+            "m-3": "",
+        }
+
+        def msg(mid, owner):
+            return {"id": mid, "metadata": {"user_id": owner}} if owner else {"id": mid}
+
+        live = [msg("m-1", "live-owner"), msg("m-2", "live-owner"), msg("m-3", "")]
+        fresh = pipeline._dedup_messages("outlook", live)
+        # m-1: dead-owner stamp must NOT shadow the live owner's re-ingest.
+        # m-2: same-owner stamp blocks. m-3: unstamped stamp blocks for all.
+        assert [m["id"] for m in fresh] == ["m-1"]
+
+        dead = [msg("m-1", "dead-owner"), msg("m-2", "dead-owner"), msg("m-3", "")]
+        fresh_dead = pipeline._dedup_messages("outlook", dead)
+        # Same rule in both directions: m-1 (stored under live-owner) does
+        # not block the dead owner either; only same-owner/unstamped blocks.
+        assert [m["id"] for m in fresh_dead] == ["m-2"]
 
 
 class TestBypassPathDedup:
