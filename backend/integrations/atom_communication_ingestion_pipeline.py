@@ -1412,11 +1412,27 @@ class CommunicationIngestionPipeline:
                 logger.debug(f"Webhook ingestion disabled for {app_type}, skipping")
                 return
 
+            # Redelivery guard: webhook providers retry deliveries (Slack
+            # re-posts on any non-200 within 3s, Graph re-notifies on
+            # subscription churn), and the poll loop can't dedup these —
+            # webhook ids never passed through _fetch_new_messages. Key on
+            # the same id the normalizer stores; messages without a stable
+            # id (the normalizer would mint a fresh timestamp id) can't be
+            # deduped here and are left to the caller to make idempotent.
+            message_id = str(message_data.get("id") or "")
+            if message_id and self.is_message_known(app_type, message_id):
+                logger.debug(f"Webhook message {message_id} already ingested ({app_type})")
+                return
+
             # Ingest the message
             logger.info(f"Processing webhook message from {app_type}")
             success = await self.ingest_message(app_type, message_data)
 
             if success:
+                # Mark only after the store write succeeded (mark-after-
+                # success contract — see _ingest_and_mark).
+                if message_id:
+                    self.mark_message_ingested(app_type, message_id)
                 logger.info(f"Successfully ingested webhook message from {app_type}")
             else:
                 logger.error(f"Failed to ingest webhook message from {app_type}")
@@ -1568,6 +1584,33 @@ class CommunicationIngestionPipeline:
             except Exception as e:
                 logger.error(f"Error in real-time ingestion for {app_type}: {str(e)}")
                 await asyncio.sleep(60)  # Wait longer on error
+
+    def is_message_known(self, app_type: str, message_id: str) -> bool:
+        """True if a message id is already recorded for this app.
+
+        The seen-id cache is reconciled against the durable store at boot and
+        periodically (see _reconcile_seen_ids_with_store), so a known id
+        means the row exists (or existed at the last reconciliation).
+        Ingestion paths that BYPASS the poll loop — webhook handlers, the
+        telegram polling worker — use this plus mark_message_ingested to get
+        the same mark-after-success dedup the poller has; without it,
+        provider redelivery (Slack retries on non-200, Graph subscription
+        redelivery, Telegram re-poll after restart) duplicated rows.
+        """
+        if not message_id:
+            return False
+        self._ensure_seen_ids_loaded()
+        with self._seen_state_lock:
+            return message_id in self._seen_message_ids.get(app_type, set())
+
+    def mark_message_ingested(self, app_type: str, message_id: str) -> None:
+        """Record a message id as ingested (call only after a successful
+        store write — a pre-marked id that never landed in the store is
+        exactly the ghost-id data-loss mode this pipeline healed from)."""
+        if not message_id:
+            return
+        with self._seen_state_lock:
+            self._seen_message_ids.setdefault(app_type, set()).add(message_id)
 
     async def _ingest_and_mark(self, app_type: str, messages: List[Dict[str, Any]]) -> None:
         """Ingest fetched messages and record their ids as seen ONLY on

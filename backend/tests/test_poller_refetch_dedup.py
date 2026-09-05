@@ -231,3 +231,84 @@ class TestStoreReconciliationSelfHeal:
             memory_manager=pipeline.memory_manager
         )
         assert restarted._seen_message_ids == {}
+
+
+class TestBypassPathDedup:
+    """Ingestion paths that bypass the poll loop (webhook handler, telegram
+    polling worker) must honor the same mark-after-success dedup contract —
+    providers redeliver webhooks, and a restart re-poll re-delivers Telegram
+    updates, which duplicated rows with no guard."""
+
+    def _webhook_message(self):
+        return {
+            "id": "slack-ev-1",
+            "app_type": "slack",
+            "sender": "u1",
+            "content": "hello from slack",
+        }
+
+    @pytest.mark.asyncio
+    async def test_webhook_redelivery_ingested_once(self, pipeline, monkeypatch):
+        calls = []
+
+        async def fake_ingest(app_type, msg):
+            calls.append(msg["id"])
+            return True
+
+        monkeypatch.setattr(pipeline, "ingest_message", fake_ingest)
+        monkeypatch.setattr(pipeline, "is_webhook_enabled", lambda app: True)
+
+        await pipeline._handle_webhook_message(self._webhook_message())
+        await pipeline._handle_webhook_message(self._webhook_message())
+
+        assert calls == ["slack-ev-1"], "redelivered webhook must be dropped"
+
+    @pytest.mark.asyncio
+    async def test_webhook_failure_is_retried(self, pipeline, monkeypatch):
+        calls = []
+
+        async def failing_ingest(app_type, msg):
+            calls.append(msg["id"])
+            return False
+
+        monkeypatch.setattr(pipeline, "ingest_message", failing_ingest)
+        monkeypatch.setattr(pipeline, "is_webhook_enabled", lambda app: True)
+
+        await pipeline._handle_webhook_message(self._webhook_message())
+        await pipeline._handle_webhook_message(self._webhook_message())
+
+        assert calls == ["slack-ev-1", "slack-ev-1"], (
+            "failed webhook ingest must not be marked seen"
+        )
+
+    @pytest.mark.asyncio
+    async def test_telegram_worker_dedup_and_stable_id(self, pipeline, monkeypatch):
+        """The telegram worker must key messages on a stable id and honor
+        mark-after-success (restart re-poll re-delivers pending updates)."""
+        ingested = []
+        monkeypatch.setattr(
+            "integrations.atom_communication_ingestion_pipeline."
+            "get_ingestion_pipeline",
+            lambda ws=None: pipeline,
+        )
+        # The worker passes the pipeline directly, not through the fixture's
+        # memory_manager attribute naming — reuse the pipeline fixture.
+        pipeline.memory_manager.db = None
+
+        async def fake_ingest(app_type, msg):
+            ingested.append(msg["id"])
+            return True
+
+        monkeypatch.setattr(pipeline, "ingest_message", fake_ingest)
+
+        from workers.telegram_polling_worker import TelegramPollingWorker
+
+        worker = TelegramPollingWorker()
+        raw = {"message_id": 42, "chat": {"id": 7}, "text": "hi", "from": {"id": 1}}
+
+        await worker._ingest_to_comm_store(raw)
+        await worker._ingest_to_comm_store(raw)  # restart re-delivery
+
+        assert ingested == ["tg_7_42"], (
+            "stable id required for cross-restart dedup; redelivery dropped"
+        )
