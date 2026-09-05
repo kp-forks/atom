@@ -504,21 +504,41 @@ class ZohoWorkDriveService(IntegrationService):
 
 
             files = []
+            # Cursor pagination (page[next]) returns up to 1000 items/request
+            # vs 50 for page[offset] — 20x fewer API calls on large drives
+            # (docs: first request page[next]=0, then follow links.cursor.next
+            # until has_next=false). Some endpoint variants (teamfolders/
+            # workspaces) don't honor it — fall back to offset pagination.
+            use_cursor = True
+            cursor_token = "0"
             offset = 0
             while True:
-                response = await self._zoho_get(
-                    target_url,
-                    headers=headers,
-                    params={"page[limit]": self.PAGE_SIZE, "page[offset]": offset},
-                )
+                if use_cursor:
+                    response = await self._zoho_get(
+                        target_url,
+                        headers=headers,
+                        params={"page[next]": cursor_token, "sort": "-last_modified"},
+                    )
+                    if response.status_code in (400, 404, 405):
+                        use_cursor = False  # endpoint variant — offset fallback
+                        continue
+                else:
+                    response = await self._zoho_get(
+                        target_url,
+                        headers=headers,
+                        params={"page[limit]": self.PAGE_SIZE, "page[offset]": offset},
+                    )
 
                 # If /files/{parent_id}/files returns 404/400, try /workspaces/{parent_id}/files as fallback
                 if response.status_code in (400, 404) and parent_id != "root":
                     ws_fallback_url = f"{self.base_url}/workspaces/{parent_id}/files"
+                    fb_params = (
+                        {"page[next]": cursor_token, "sort": "-last_modified"}
+                        if use_cursor
+                        else {"page[limit]": self.PAGE_SIZE, "page[offset]": offset}
+                    )
                     fallback_res = await self._zoho_get(
-                        ws_fallback_url,
-                        headers=headers,
-                        params={"page[limit]": self.PAGE_SIZE, "page[offset]": offset},
+                        ws_fallback_url, headers=headers, params=fb_params,
                     )
                     if fallback_res.status_code == 200:
                         response = fallback_res
@@ -553,9 +573,23 @@ class ZohoWorkDriveService(IntegrationService):
                         "modified_at": attrs.get("modified_time_in_iso8601") or attrs.get("modified_time")
                     })
 
-                if len(page_items) < self.PAGE_SIZE or len(files) >= self.MAX_LIST_ITEMS:
+                if use_cursor:
+                    cursor = (data.get("links") or {}).get("cursor") or {}
+                    if not cursor.get("has_next") or not cursor.get("next"):
+                        break
+                    from urllib.parse import urlparse, parse_qs
+                    qs = parse_qs(urlparse(cursor["next"]).query)
+                    next_token = (qs.get("page[next]") or [None])[0]
+                    if not next_token:
+                        break
+                    cursor_token = next_token
+                else:
+                    if len(page_items) < self.PAGE_SIZE or len(files) >= self.MAX_LIST_ITEMS:
+                        break
+                    offset += self.PAGE_SIZE
+
+                if len(files) >= self.MAX_LIST_ITEMS:
                     break
-                offset += self.PAGE_SIZE
 
             # Recursive traversal if requested. Subfolders are always regular
             # folders (even inside team folders / workspaces), so recurse with

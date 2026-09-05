@@ -1546,7 +1546,10 @@ class HybridDataIngestionService:
     # TOTAL cap, 8 folders × 2000 items = 16k records through the ingest
     # loop, which is what made suite syncs run for hours and die to
     # restarts before the CRM/Books modules ever ran.
-    _WD_SYNC_FILE_RECORD_CAP = 2000
+    # Per-sync cap on WorkDrive records entering the pipeline. Env-tunable
+    # for TB-scale drives (cursor pagination made the metadata walk cheap;
+    # this bounds per-cycle record processing instead).
+    _WD_SYNC_FILE_RECORD_CAP = int(os.getenv("WD_SYNC_FILE_RECORD_CAP", "2000"))
 
     def _zoho_incremental_cursor(self) -> Optional[datetime]:
         """Last cleanly-synced fetch watermark for the Zoho suite — None when
@@ -1713,6 +1716,23 @@ class HybridDataIngestionService:
                                     _doc_ingestor = None
 
                                 _wd_appended = 0  # total WD records this sync
+                                # Modified-since cursor (2026-09-05): WorkDrive's
+                                # API has no delta endpoint, so cursor lives
+                                # client-side — last successful zoho sync.
+                                # Files older than the cursor are already
+                                # ingested (upserts dedupe by modified time);
+                                # skipping them avoids re-processing on every
+                                # cycle. Folders are NEVER filtered: their
+                                # mtime doesn't bubble up from descendants, so
+                                # filtering would break subtree traversal.
+                                _zoho_stats = self.usage_stats.get("zoho")
+                                _wd_modified_since = (
+                                    _zoho_stats.last_synced if _zoho_stats else None
+                                )
+                                if _wd_modified_since:
+                                    logger.info(
+                                        f"[WD] modified-since cursor: {_wd_modified_since.isoformat()}"
+                                    )
                                 for fid in folder_ids[:8]:  # top team folders per sync
                                     if _wd_appended >= self._WD_SYNC_FILE_RECORD_CAP:
                                         break
@@ -1749,6 +1769,24 @@ class HybridDataIngestionService:
                                             # binary archives / non-documents:
                                             # no retrieval value, pure noise
                                             continue
+                                        # Cursor filter: unchanged files are
+                                        # already ingested — skip by modified
+                                        # time instead of re-appending (the
+                                        # DB upsert dedupes anyway, but this
+                                        # avoids the record-processing and
+                                        # content-parse budget spend).
+                                        if _wd_modified_since and f.get("modified_at"):
+                                            try:
+                                                from datetime import datetime as _dt
+                                                _fm = _dt.fromisoformat(
+                                                    str(f["modified_at"]).replace("Z", "+00:00")
+                                                )
+                                                if _fm.tzinfo is None:
+                                                    _fm = _fm.replace(tzinfo=timezone.utc)
+                                                if _fm <= _wd_modified_since:
+                                                    continue
+                                            except (ValueError, TypeError):
+                                                pass  # unparseable mtime — let dedupe handle it
                                         records.append({
                                             "id": f"wd_{f.get('id')}",
                                             "type": "workdrive_file",
