@@ -929,9 +929,6 @@ class OutlookService(IntegrationService):
                 )
                 return False
         try:
-            reply_data: Dict[str, Any] = {
-                "comment": comment
-            }
             overrides: Dict[str, Any] = {}
             if to_recipients:
                 overrides["toRecipients"] = [
@@ -943,6 +940,23 @@ class OutlookService(IntegrationService):
                 ]
             if subject:
                 overrides["subject"] = subject
+
+            # HTML replies: /reply's `comment` param is plain text — styled
+            # bodies (signature HTML, tables, links) arrive as literal tags
+            # in Outlook. Route tag-bearing comments through createReply →
+            # PATCH the draft's HTML body → send; plain comments keep the
+            # one-shot path. Falls back to the legacy path on any step
+            # failure so styling never costs the send itself.
+            if self._HTML_TAG_RE.search(str(comment or "")):
+                sent = await self._send_html_reply(
+                    user_id, message_id, comment, overrides,
+                    reply_all=reply_all, access_token=token,
+                )
+                if sent is not None:
+                    return sent
+            reply_data: Dict[str, Any] = {
+                "comment": comment
+            }
             if overrides:
                 reply_data["message"] = overrides
             action = "replyAll" if reply_all else "reply"
@@ -953,6 +967,49 @@ class OutlookService(IntegrationService):
         except Exception as e:
             logger.error(f"Error replying to email: {e}")
             return False
+
+    async def _send_html_reply(
+        self,
+        user_id: str,
+        message_id: str,
+        comment: str,
+        overrides: Dict[str, Any],
+        reply_all: bool = False,
+        access_token: Optional[str] = None,
+    ) -> Optional[bool]:
+        """createReply → PATCH the draft's HTML body (+ recipient/subject
+        overrides) → send. Returns None to signal "fall back to the legacy
+        comment path" when any step fails; True/False when the reply was
+        (not) sent via this route."""
+        try:
+            action = "replyAll" if reply_all else "reply"
+            draft = await self._make_graph_request(
+                user_id, f"/me/messages/{message_id}/{action}", "POST",
+                {}, access_token=access_token,
+            )
+            draft_id = (draft or {}).get("id")
+            if not draft_id:
+                return None
+            patch: Dict[str, Any] = {
+                "body": {"contentType": "HTML",
+                         "content": self._body_to_html(comment)},
+            }
+            if overrides:
+                patch.update(overrides)
+            patched = await self._make_graph_request(
+                user_id, f"/me/messages/{draft_id}", "PATCH",
+                patch, access_token=access_token,
+            )
+            if patched is None:
+                return None
+            sent = await self._make_graph_request(
+                user_id, f"/me/messages/{draft_id}/send", "POST",
+                {}, access_token=access_token,
+            )
+            return sent is not None
+        except Exception as e:
+            logger.warning(f"HTML reply route failed for {user_id}: {e} — falling back")
+            return None
 
     async def _thread_embed(self, texts: List[str]) -> List[List[float]]:
         """Embedder for the leak guard's semantic tier, cached process-wide —

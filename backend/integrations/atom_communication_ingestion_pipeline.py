@@ -92,6 +92,44 @@ async def _bounded_extraction(coro: Any) -> Any:
 
 _HTML_TAG_RE = _re_mod.compile(r"<(script|style)[^>]*>.*?</\1>|<[^>]+>", _re_mod.DOTALL | _re_mod.IGNORECASE)
 _HTML_WS_RE = _re_mod.compile(r"[ \t]*\n[ \t\n]*")
+# <a href> → [text](href) BEFORE tag-stripping: plain tag-stripping deleted
+# the href and kept only the anchor text, so ingested email lost every link
+# (agents could neither cite nor reproduce them — observed Sept 6).
+_HTML_ANCHOR_RE = _re_mod.compile(
+    r"<a\s[^>]*?href\s*=\s*[\"']([^\"']+)[\"'][^>]*>(.*?)</a>",
+    _re_mod.DOTALL | _re_mod.IGNORECASE,
+)
+# Style-bearing markup worth keeping the raw HTML for: signatures (styled
+# tables/fonts), data tables, images, links. Plain <p>text</p> bodies don't
+# justify the metadata size.
+_HTML_STYLE_MARKUP_RE = _re_mod.compile(
+    r"<(table|img)\b|style\s*=|\bclass\s*=|<a\s", _re_mod.IGNORECASE
+)
+_MAX_INGEST_HTML_CHARS = 64_000
+
+
+def _preserve_links_in_html(html_body: str) -> str:
+    """Rewrite <a href="URL">text</a> as [text](URL) so the href survives
+    the tag-stripping text conversion. Never raises."""
+    if not html_body or "<a" not in html_body.lower():
+        return html_body
+
+    def _anchor_text(inner: str) -> str:
+        text = _HTML_TAG_RE.sub("", inner)
+        text = _html_mod.unescape(text)
+        return _re_mod.sub(r"\s+", " ", text).strip()
+
+    try:
+        def _repl(m: "_re_mod.Match") -> str:
+            href, inner = m.group(1), m.group(2)
+            text = _anchor_text(inner)
+            if not text or text.lower() in ("click here", "here", "link"):
+                text = href
+            return f"[{text}]({href})"
+
+        return _HTML_ANCHOR_RE.sub(_repl, html_body)
+    except Exception:
+        return html_body
 
 
 def _format_graph_timestamp(dt: datetime) -> str:
@@ -127,7 +165,7 @@ def _extract_tables_from_html(html_body: str):
         return html_body, tables
 
     def _cell_text(raw: str) -> str:
-        text = _HTML_TAG_RE.sub(" ", raw)
+        text = _HTML_TAG_RE.sub(" ", _preserve_links_in_html(raw))
         text = _html_mod.unescape(text)
         text = _HTML_WS_RE.sub(" ", text).strip()
         return text.replace("|", "\\|")[:200]
@@ -224,11 +262,13 @@ def _extract_tables_from_html(html_body: str):
 
 def _html_to_text(html_body: str) -> str:
     """Graph email bodies arrive as HTML; strip tags so FTS/vector search
-    indexes readable text instead of markup. Never raises."""
+    indexes readable text instead of markup. Anchors are rewritten to
+    markdown links first (_preserve_links_in_html) so the href survives.
+    Never raises."""
     if not html_body:
         return ""
     try:
-        text = _HTML_TAG_RE.sub("\n", html_body)
+        text = _HTML_TAG_RE.sub("\n", _preserve_links_in_html(html_body))
         text = _html_mod.unescape(text)
         return _HTML_WS_RE.sub("\n", text).strip()
     except Exception:
@@ -4020,7 +4060,15 @@ class CommunicationIngestionPipeline:
                 or ""
             )
             _email_tables: List[Dict] = []
+            raw_html: Optional[str] = None
             if str(message_data.get("content_type", "")).lower() == "html":
+                # Style preservation: the tag-stripped text below is what
+                # search indexes, but signatures/table styling/links live
+                # only in the original markup. Keep a size-capped raw HTML
+                # copy in metadata so agents can reproduce the exact
+                # formatting (styled tables, the user's default signature).
+                if _HTML_STYLE_MARKUP_RE.search(content or ""):
+                    raw_html = content[:_MAX_INGEST_HTML_CHARS]
                 content, _email_tables = _html_to_text_with_tables(content)
             # Secrets redaction: email bodies are attacker-controlled text that
             # agents recall later. Reuse the document-path redactor so stored
@@ -4061,6 +4109,8 @@ class CommunicationIngestionPipeline:
                 # the table in ingested data and can rebuild it as a real
                 # HTML table in the email canvas (editor-taught).
                 _email_meta["tables"] = _email_tables[:5]
+            if raw_html:
+                _email_meta["html_body"] = raw_html
             if _inner_meta.get("user_id"):
                 _email_meta["user_id"] = _inner_meta["user_id"]
             return {
