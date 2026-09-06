@@ -343,3 +343,27 @@ def test_heal_on_fresh_store_is_a_clean_noop():
         f"app_type = '{mgr._HEAL_MARKER}'", prefilter=True
     ).limit(5).to_arrow().to_pylist()
     assert len(markers) == 1 and markers[0]["total_messages"] == 0
+
+
+# --- Knowledge-extraction backfill budget ----------------------------------
+
+def test_extraction_age_gate_blocks_old_messages(monkeypatch):
+    from integrations.atom_communication_ingestion_pipeline import (
+        _extraction_age_blocked,
+    )
+
+    monkeypatch.setenv("ATOM_KG_EXTRACT_MAX_AGE_DAYS", "30")
+    assert _extraction_age_blocked("2026-01-19T10:00:00Z") is True   # ~8 months old
+    assert _extraction_age_blocked("2026-09-06T09:00:00Z") is False  # today
+    monkeypatch.setenv("ATOM_KG_EXTRACT_MAX_AGE_DAYS", "0")          # gate off
+    assert _extraction_age_blocked("2026-01-19T10:00:00Z") is False
+
+
+def test_extraction_age_gate_never_blocks_unparseable(monkeypatch):
+    from integrations.atom_communication_ingestion_pipeline import (
+        _extraction_age_blocked,
+    )
+
+    monkeypatch.setenv("ATOM_KG_EXTRACT_MAX_AGE_DAYS", "30")
+    assert _extraction_age_blocked("not-a-date") is False
+    assert _extraction_age_blocked(None) is False

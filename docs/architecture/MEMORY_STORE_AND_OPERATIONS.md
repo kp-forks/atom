@@ -251,3 +251,13 @@ ingested mailbox → per-term retries → semantic memory → honest dead-end.
 it names the user's ACTUALLY connected mailbox/chat tools
 (`_mailbox_tool_hint` via `get_connected_services`, neutral wording when
 none), so gmail-only agents are never told to use a tool they don't have.
+
+**Backfill extraction budget (2026-09-06 evening):** a restart-time poll
+backfilled 179 never-seen old messages; each fired TWO LLM pipelines
+(knowledge extraction + communication intelligence), saturating the event
+loop for 30+ minutes — every endpoint starved, which surfaced as the chat
+"open in canvas" button silently timing out (`ECONNABORTED` at 30s, the
+frontend catch swallowed it). Auto-extraction is now age-budgeted:
+`ATOM_KG_EXTRACT_MAX_AGE_DAYS` (default 30, 0 = unlimited). Older backfill
+is indexed and searchable but does not fire LLM extraction. The frontend
+to-canvas handlers now toast on failure instead of an empty catch.

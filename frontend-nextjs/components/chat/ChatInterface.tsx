@@ -204,7 +204,13 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({ sessionId, onSessionCreat
             const data = await createCanvasFromMessage(lastAssistant.content, draftCandidates);
             openCanvasFromData(data, lastAssistant.id);
         } catch {
-            // backend may still be processing; the canvas is created server-side
+            // Same contract as openMessageInCanvas: failures are surfaced,
+            // never swallowed.
+            toast({
+                title: "Couldn't open the canvas",
+                description: "The backend didn't respond in time — it may be busy. Please try again in a moment.",
+                variant: "destructive",
+            });
         } finally {
             setOpeningCanvas(false);
         }
@@ -224,7 +230,15 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({ sessionId, onSessionCreat
             );
             openCanvasFromData(data, message.id);
         } catch {
-            // backend may still be processing; the canvas is created server-side
+            // Never silent: an empty catch turned a backend outage into a
+            // button that "does nothing" (2026-09-06 — to-canvas timed out
+            // while the backend's event loop was saturated and the user had
+            // no idea why). Say what happened.
+            toast({
+                title: "Couldn't open the canvas",
+                description: "The backend didn't respond in time — it may be busy. Please try again in a moment.",
+                variant: "destructive",
+            });
         } finally {
             setOpeningCanvas(false);
         }

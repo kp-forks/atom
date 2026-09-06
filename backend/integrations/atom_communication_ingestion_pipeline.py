@@ -55,6 +55,28 @@ _extraction_semaphores: Dict[int, asyncio.Semaphore] = {}
 _extraction_semaphores_lock = threading.Lock()
 
 
+def _extraction_age_blocked(timestamp: Any) -> bool:
+    """True when a message is older than the auto-extraction age budget
+    (ATOM_KG_EXTRACT_MAX_AGE_DAYS, default 30; 0 disables the gate).
+    Backfilled old mail stays indexed and searchable but does not auto-fire
+    the per-message LLM extraction pipelines. Unparseable timestamps never
+    gate (extract as before)."""
+    try:
+        max_age_days = max(0, int(os.getenv("ATOM_KG_EXTRACT_MAX_AGE_DAYS", "30")))
+    except ValueError:
+        max_age_days = 30
+    if not max_age_days:
+        return False
+    try:
+        msg_dt = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+        if msg_dt.tzinfo is None:
+            msg_dt = msg_dt.replace(tzinfo=timezone.utc)
+        age_days = (datetime.now(timezone.utc) - msg_dt).total_seconds() / 86400
+        return age_days > max_age_days
+    except (ValueError, TypeError):
+        return False
+
+
 async def _bounded_extraction(coro: Any) -> Any:
     """Run one extraction coroutine under the per-event-loop concurrency cap."""
     loop_id = id(asyncio.get_running_loop())
@@ -2027,8 +2049,27 @@ class CommunicationIngestionPipeline:
                 # Trigger Knowledge Extraction asynchronously if enabled and content exists
                 from core.automation_settings import get_automation_settings
                 settings = get_automation_settings()
-                
-                if settings.is_automations_enabled() and settings.is_extraction_enabled() and comm_data.content and len(comm_data.content.strip()) > 20:
+
+                # Backfill budget: a poll after restart can ingest hundreds of
+                # never-seen OLD messages at once (cursor rollback / widened
+                # window). Each one fires TWO LLM extraction pipelines; on
+                # 2026-09-06 a 179-message backfill saturated the event loop
+                # for 30+ minutes (every endpoint starved — the chat
+                # "open in canvas" button timed out silently) and burned
+                # thousands of routed-LLM calls re-deriving January threads.
+                # Messages older than the budget are indexed and searchable,
+                # but do not auto-fire LLM extraction.
+                extraction_blocked = _extraction_age_blocked(comm_data.timestamp)
+                if extraction_blocked:
+                    logger.info(
+                        f"Knowledge extraction skipped for {comm_data.id} "
+                        f"(older than ATOM_KG_EXTRACT_MAX_AGE_DAYS budget — "
+                        f"backfill indexed without LLM extraction)"
+                    )
+
+                if (settings.is_automations_enabled() and settings.is_extraction_enabled()
+                        and not extraction_blocked
+                        and comm_data.content and len(comm_data.content.strip()) > 20):
                     try:
                         # 1. Standard Knowledge Extraction
                         knowledge_manager = get_knowledge_ingestion()
