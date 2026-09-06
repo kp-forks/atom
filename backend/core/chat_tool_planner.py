@@ -75,6 +75,33 @@ _INTENT_ACTIONS: Dict[str, Dict[str, str]] = {
 _STORAGE_SERVICES = (
     "zoho_workdrive", "google_drive", "onedrive", "dropbox", "box",
 )
+# Mailbox/chat services routed through the universal path (outlook has its
+# own dedicated leg). Every one of them shares Graph's failure class: the
+# live search ranks by opaque provider relevance, misses sender ADDRESSES,
+# and fills its slots with unrelated recent traffic — while the ingested
+# comms store holds deterministic sender/recipient copies of everything the
+# workspace has seen. Their blocks therefore get the same ranked ingested-
+# copy supplement (live 2026-09-06: the jschulz thread sat in the store
+# while outlook's live search returned other customers' lead forms; the
+# identical shape is one token grant away for gmail/slack/telegram).
+_COMMUNICATION_SERVICES = (
+    "gmail", "slack", "teams", "discord", "google_chat", "telegram",
+    "whatsapp", "zoho_mail",
+)
+
+
+def _haystack_has_address(query: str, context: Optional[Dict[str, Any]]) -> bool:
+    """True when an email-address fragment appears in the query or recent
+    history — the trigger for the ingested-mailbox supplement on ANY
+    service (a CRM lead lookup by address benefits from the thread copies
+    just as much as a mailbox search does)."""
+    import re as _re
+
+    hay = query + " " + " ".join(
+        _entry_text(m) for m in ((context or {}).get("history") or [])[-6:]
+    )
+    return bool(_re.search(r"[\w.+-]+@[\w.-]+\.\w+", hay))
+
 # Live search services whose queries identifiers must never be lost from.
 # Two tolerance grades, both safe for the net (the net only fires when the
 # draft query carries NO identifier token, and only APPENDS ≤2 codes from
@@ -696,6 +723,65 @@ def _search_ingested_by_address(user_id, address, limit=4):
     return out
 
 
+async def _ingested_mailbox_lines(
+    user_id, query, context=None, cap: int = 6, hybrid_min: int = 4
+) -> List[str]:
+    """Ranked ingested-mailbox lines for a communication lookup — the second
+    source every mailbox-shaped search gets. Address fragments (query AND
+    recent history) drive the deterministic scan — ONE full-table load per
+    distinct address (the same address in query and history used to trigger
+    two); the hybrid/semantic search only fills slots below ``hybrid_min``
+    (embedding init + vector search was a real contributor to exec timeouts
+    under load, live 2026-09-06, and free-text live APIs — Graph included —
+    do not reliably match sender addresses or nicknames). Fault-isolated:
+    [] on anything."""
+    store_lines: List[str] = []
+    import re as _re_addr
+
+    _addr_haystack = query + " " + " ".join(
+        _entry_text(m) for m in ((context or {}).get("history") or [])[-6:]
+    )
+    _seen_addrs = set()
+    for _addr in _re_addr.findall(r"[\w.+-]+@[\w.-]+", _addr_haystack):
+        if _addr.lower() in _seen_addrs:
+            continue
+        _seen_addrs.add(_addr.lower())
+        for _line in _search_ingested_by_address(user_id, _addr):
+            if _line not in store_lines:
+                store_lines.append(_line)
+                if len(store_lines) >= cap:
+                    break
+        if len(store_lines) >= cap:
+            break
+
+    if len(store_lines) < hybrid_min:
+        try:
+            from core.hybrid_search.documents_hybrid import (
+                DocumentsHybridSearch,
+            )
+
+            store_result = await DocumentsHybridSearch().search(
+                query=query[:200], limit=6, owner_user_id=user_id
+            )
+            for hit in (store_result or {}).get("results") or []:
+                if str(hit.get("source") or "") != "communication":
+                    continue
+                sender = str(hit.get("sender") or "?")
+                title = str(hit.get("title") or "")
+                snippet = str(hit.get("preview") or "")[:220]
+                ts = str(hit.get("as_of") or "")
+                line = (
+                    f"- [ingested mailbox] From: {sender} | {title} | {snippet} | {ts}"
+                )
+                if line not in store_lines:
+                    store_lines.append(line)
+                if len(store_lines) >= cap:
+                    break
+        except Exception as store_err:
+            logger.debug(f"comms-store supplement skipped: {store_err}")
+    return store_lines
+
+
 _PRODUCT_TOKEN_RE = re.compile(
     r"\b(?=[A-Za-z-]*\d)(?=[A-Za-z0-9-]*[A-Za-z])[A-Za-z0-9][A-Za-z0-9-]{4,}\b"
 )
@@ -1243,66 +1329,9 @@ async def execute_tool_plan(
             ranked = sorted(merged.values(), key=_rank)
             emails = [x["email"] for x in ranked[:8]]
 
-            # DETERMINISTIC FIRST, and only ONE table load per distinct
-            # address: the ranked ingested-copy lookup needs no embeddings
-            # and no Graph. Address fragments come from the query AND the
-            # surrounding history (the user's message often lacks the
-            # address — "find Jason's response"); the same address in both
-            # used to trigger two full-table loads per turn.
-            import re as _re_addr
-
-            store_lines: List[str] = []
-            _addr_haystack = query + " " + " ".join(
-                _entry_text(m) for m in ((context or {}).get("history") or [])[-6:]
-            )
-            _seen_addrs = set()
-            for _addr in _re_addr.findall(r"[\w.+-]+@[\w.-]+", _addr_haystack):
-                if _addr.lower() in _seen_addrs:
-                    continue
-                _seen_addrs.add(_addr.lower())
-                for _line in _search_ingested_by_address(user_id, _addr):
-                    if _line not in store_lines:
-                        store_lines.append(_line)
-                        if len(store_lines) >= 6:
-                            break
-                if len(store_lines) >= 6:
-                    break
-
-            # SECOND SOURCE — the ingested mailbox memory via hybrid search.
-            # Graph free-text $search does not reliably match sender
-            # ADDRESSES or nicknames (live 2026-09-02: "find Jason's
-            # response" — the sender is "Jacob" Schulz, and the address
-            # local-part 'jschulz' never matched), while the ingested copy
-            # carries the full content plus sender/recipient fields. The
-            # deterministic scan above already covers address-shaped needs;
-            # this (embedding init + vector search — a real contributor to
-            # exec timeouts under load, live 2026-09-06) only fills the
-            # slots nicknames/semantic misses leave open.
-            if len(store_lines) < 4:
-                try:
-                    from core.hybrid_search.documents_hybrid import (
-                        DocumentsHybridSearch,
-                    )
-
-                    store_result = await DocumentsHybridSearch().search(
-                        query=query[:200], limit=6, owner_user_id=user_id
-                    )
-                    for hit in (store_result or {}).get("results") or []:
-                        if str(hit.get("source") or "") != "communication":
-                            continue
-                        sender = str(hit.get("sender") or "?")
-                        title = str(hit.get("title") or "")
-                        snippet = str(hit.get("preview") or "")[:220]
-                        ts = str(hit.get("as_of") or "")
-                        line = (
-                            f"- [ingested mailbox] From: {sender} | {title} | {snippet} | {ts}"
-                        )
-                        if line not in store_lines:
-                            store_lines.append(line)
-                        if len(store_lines) >= 6:
-                            break
-                except Exception as store_err:
-                    logger.debug(f"comms-store supplement skipped: {store_err}")
+            # DETERMINISTIC FIRST: ranked ingested-copy lookup — shared with
+            # the universal communication path (gmail/slack/telegram/…).
+            store_lines = await _ingested_mailbox_lines(user_id, query, context)
 
             if not emails and not store_lines:
                 # A mailbox miss is not the whole story: the question may be
@@ -1445,6 +1474,21 @@ async def execute_tool_plan(
                 # Zoho Inventory".
                 reason = f"{service}.{action} has no live implementation"
             reason = reason[:160]
+            # Communication services: the DETERMINISTIC ingested mailbox is
+            # the first second source, ahead of the semantic leg — the whole
+            # jschulz lesson was that semantic/free-text search misses
+            # addresses while the comms store holds exact sender/recipient
+            # copies (generalized from the outlook leg, live 2026-09-06).
+            if service in _COMMUNICATION_SERVICES:
+                mail_lines = await _ingested_mailbox_lines(user_id, query, context)
+                if mail_lines:
+                    return _with_grounding(
+                        f"LIVE TOOL RESULTS ({service}.{action}, query='{query}'): "
+                        f"the live {service} search returned nothing usable "
+                        f"({reason}). INGESTED MAILBOX matches (deterministic "
+                        f"sender/recipient lookup over the workspace's own "
+                        f"copies):\n" + "\n".join(mail_lines)
+                    )
             # Empty live search is precisely where the model declares "I
             # don't have that file" about content that IS stored — the
             # ingested workspace indexes copies of these files and every
@@ -1508,6 +1552,27 @@ async def execute_tool_plan(
                     f"records, not contents. INGESTED COPY, full-text search "
                     f"over the workspace's own extracted file contents "
                     f"(authoritative for what the files SAY):\n{mem_block}"
+                )
+        if service in _COMMUNICATION_SERVICES or _haystack_has_address(query, context):
+            # Same anchoring lesson as the outlook leg: a live mailbox/chat
+            # search "succeeds" with whatever the provider's relevance
+            # ranking surfaced — often unrelated traffic — and the reply
+            # model echoes the first lines it reads. Deterministic ingested
+            # matches LEAD the block; the live payload follows as
+            # supplemental. Also fires for ANY service when the conversation
+            # carries an address: the ingested thread copies are the
+            # authoritative record for that participant regardless of which
+            # app the planner picked.
+            mail_lines = await _ingested_mailbox_lines(user_id, query, context, cap=4)
+            if mail_lines:
+                return _with_grounding(
+                    f"LIVE TOOL RESULTS ({service}.{action}, query='{query}') — "
+                    f"INGESTED MAILBOX matches first (deterministic "
+                    f"sender/recipient lookup; authoritative for threads):\n"
+                    + "\n".join(mail_lines)
+                    + f"\n\nLive {service} results (supplemental — provider "
+                    f"relevance ranking, known to miss sender addresses):\n"
+                    f"{str(data)[:1800]}"
                 )
         return _with_grounding(header)
     except Exception as e:

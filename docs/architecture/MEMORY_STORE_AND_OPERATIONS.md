@@ -228,3 +228,14 @@ mistakes are recoverable — maintenance keeps 7 days of table versions.
 Chat-side, the address lookup in `core/chat_tool_planner.py`
 (`_rank_address_hits`) additionally dedupes for PRESENTATION (re-ingested
 copies under re-stamped timestamps share content but not row ids).
+
+**Generalization (2026-09-06, later same day):** the ingested-mailbox
+supplement is no longer outlook-specific. gmail, slack, teams, discord,
+google_chat, telegram, whatsapp and zoho_mail route through the universal
+integration path in `core/chat_tool_planner.py`, and their blocks now get
+the same ranked ingested-copy rescue — ingested lines LEAD a successful
+live search (provider relevance ranking is known to bury participant
+messages under unrelated traffic), carry the dead-end when the live search
+returns nothing, and fire for ANY service once an email-address fragment
+appears in the query or recent history. `_ingested_mailbox_lines` is the
+shared helper; the outlook leg calls it too.
