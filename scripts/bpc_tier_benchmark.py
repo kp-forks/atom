@@ -153,18 +153,24 @@ def check(task: dict, response: str):
         return ("PASS" if not bad else "FAIL"), bad
     if ctype == "schedule_constraint":
         low = text.lower()
-        days = ["monday", "tuesday", "wednesday", "thursday", "friday"]
+        _DAY_FULL = {"mon": "monday", "tue": "tuesday", "tues": "tuesday",
+                     "wed": "wednesday", "weds": "wednesday",
+                     "thu": "thursday", "thur": "thursday", "thurs": "thursday",
+                     "fri": "friday"}
 
         def day_for(who):
             m = re.search(rf"{re.escape(who.lower())}\s*[:=]\s*(\w+)", low)
-            return m.group(1) if m else None
+            if not m:
+                return None
+            d = m.group(1)
+            return _DAY_FULL.get(d, d)  # accept Wed / Weds / Wednesday ...
 
         bad = {}
         assigned = {}
         for who in ("Alice", "Bob", "Client"):
             d = day_for(who)
             assigned[who] = d
-            if d not in days:
+            if d not in ("monday", "tuesday", "wednesday", "thursday", "friday"):
                 bad[who] = f"unparsed day: {d}"
         want_client = c["required"]["Client"].lower()
         if assigned.get("Client") != want_client:

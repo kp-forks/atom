@@ -79,6 +79,8 @@ class TestCheckerTypes:
         assert check(_checker_task(c), ok2)[0] == "PASS"
         assert check(_checker_task(c), "Alice: Monday 10:00\nBob: Thursday 11:00\nClient: Friday 09:00")[0] == "FAIL"
         assert check(_checker_task(c), "Alice: Wednesday 10:00\nBob: Wednesday 15:00\nClient: Friday 09:00")[0] == "FAIL"
+        # Day abbreviations must be accepted.
+        assert check(_checker_task(c), "Alice: Wed 09:00\nBob: Thu 11:00\nClient: Fri 09:00")[0] == "PASS"
 
     def test_labeled_numerics(self):
         c = {"type": "labeled_numerics",
