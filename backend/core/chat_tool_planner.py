@@ -629,12 +629,50 @@ def _context_identifier_net(ctx: Dict[str, Any], query: str, limit: int = 2) -> 
     ][:limit]
 
 
+def _rank_address_hits(rows: List[Dict[str, Any]], addr_l: str, limit: int = 4) -> List[Dict[str, Any]]:
+    """Rank raw comms rows matching an address. Participant rows (the
+    address appears in sender/recipient — actual thread members) outrank
+    body-only mentions (quoted threads, lead-form echoes); newest first
+    within a tier. Rows arrive in table (insertion) order, not relevance:
+    with a thread's key messages ingested late, a first-N cap surfaced lead
+    forms and internal chatter while the actual reply sat near the end of
+    the table (live 2026-09-06: jschulz@blumetric.ca — Jacob's reply and the
+    sent quote never made the cap). Exact duplicate rows (re-ingested
+    copies) collapse to one so they don't burn cap slots."""
+    seen_keys = set()
+    scored = []
+    for row in rows:
+        sender = str(row.get("sender") or "")
+        recipient = str(row.get("recipient") or "")
+        subj = str(row.get("subject") or "")
+        content = str(row.get("content") or "")
+        ts = str(row.get("timestamp") or "")
+        # Body prefix in the key: re-ingested copies can carry a re-stamped
+        # timestamp (so (sender, recipient, subject, ts) misses them, live
+        # 2026-09-06) but near-identical bodies. Distinct replies in one
+        # thread differ in body well within the prefix.
+        key = (sender, recipient, subj, content[:120])
+        if key in seen_keys:
+            continue
+        blob = f"{sender} {recipient} {content} {subj}".lower()
+        if addr_l not in blob:
+            continue
+        seen_keys.add(key)
+        participant = addr_l in sender.lower() or addr_l in recipient.lower()
+        scored.append((0 if participant else 1, ts, row))
+    # Two stable sorts: newest first overall, then participant tier wins.
+    scored.sort(key=lambda t: t[1], reverse=True)
+    scored.sort(key=lambda t: t[0])
+    return [t[2] for t in scored[:limit]]
+
+
 def _search_ingested_by_address(user_id, address, limit=4):
     """Deterministic LanceDB lookup of ingested messages tied to an email
-    address (sender/recipient/content containment). Graph free-text search
-    does not reliably match sender ADDRESSES (live 2026-09-02: Jacob Schulz's
-    reply never surfaced because 'jschulz' is only the local part of the
-    sender address) — the ingested copy is authoritative here and needs no
+    address (sender/recipient/content containment, participant rows ranked
+    first — see _rank_address_hits). Graph free-text search does not
+    reliably match sender ADDRESSES (live 2026-09-02: Jacob Schulz's reply
+    never surfaced because 'jschulz' is only the local part of the sender
+    address) — the ingested copy is authoritative here and needs no
     embeddings. Fault-isolated; [] on anything."""
     out = []
     if not address or "@" not in address:
@@ -646,20 +684,13 @@ def _search_ingested_by_address(user_id, address, limit=4):
         db = lancedb.connect(str(base / "default"))
         table = db.open_table("atom_communications")
         df = table.to_arrow().to_pandas()
-        addr_l = address.lower()
-        for _, row in df.iterrows():
-            blob = " ".join(
-                str(row.get(c) or "") for c in ("sender", "recipient", "content", "subject")
-            ).lower()
-            if addr_l in blob:
-                out.append(
-                    f"- [ingested mailbox] From: {row.get('sender')} | "
-                    f"{str(row.get('subject') or '')[:90]} | "
-                    f"{str(row.get('content') or '')[:260]} | "
-                    f"{str(row.get('timestamp') or '')[:19]}"
-                )
-                if len(out) >= limit:
-                    break
+        for row in _rank_address_hits(df.to_dict("records"), address.lower(), limit=limit):
+            out.append(
+                f"- [ingested mailbox] From: {row.get('sender')} | "
+                f"{str(row.get('subject') or '')[:90]} | "
+                f"{str(row.get('content') or '')[:260]} | "
+                f"{str(row.get('timestamp') or '')[:19]}"
+            )
     except Exception as e:
         logger.debug(f"ingested address search skipped: {e}")
     return out
@@ -1212,50 +1243,23 @@ async def execute_tool_plan(
             ranked = sorted(merged.values(), key=_rank)
             emails = [x["email"] for x in ranked[:8]]
 
-            # SECOND SOURCE — the ingested mailbox memory. Graph free-text
-            # $search does not reliably match sender ADDRESSES or nicknames
-            # (live 2026-09-02: "find Jason's response" — the sender is
-            # "Jacob" Schulz, and the address local-part 'jschulz' never
-            # matched), while the ingested copy carries the full content
-            # plus sender/recipient fields. Supplement, don't replace.
-            store_lines: List[str] = []
-            try:
-                from core.hybrid_search.documents_hybrid import (
-                    DocumentsHybridSearch,
-                )
-
-                store_result = await DocumentsHybridSearch().search(
-                    query=query[:200], limit=6, owner_user_id=user_id
-                )
-                seen_subjects = {
-                    str(e.get("subject") or "").strip().lower() for e in emails
-                }
-                for hit in (store_result or {}).get("results") or []:
-                    if str(hit.get("source") or "") != "communication":
-                        continue
-                    sender = str(hit.get("sender") or "?")
-                    title = str(hit.get("title") or "")
-                    snippet = str(hit.get("preview") or "")[:220]
-                    ts = str(hit.get("as_of") or "")
-                    store_lines.append(
-                        f"- [ingested mailbox] From: {sender} | {title} | {snippet} | {ts}"
-                    )
-                    if len(store_lines) >= 4:
-                        break
-            except Exception as store_err:
-                logger.debug(f"comms-store supplement skipped: {store_err}")
-
-            # Address fragments get a DETERMINISTIC ingested lookup —
-            # nicknames ("Jason" vs "Jacob") and Graph's address indexing
-            # both miss these. The user's message often lacks the address
-            # ("find Jason's response"), but the surrounding conversation
-            # carries it — scan the recent history too.
+            # DETERMINISTIC FIRST, and only ONE table load per distinct
+            # address: the ranked ingested-copy lookup needs no embeddings
+            # and no Graph. Address fragments come from the query AND the
+            # surrounding history (the user's message often lacks the
+            # address — "find Jason's response"); the same address in both
+            # used to trigger two full-table loads per turn.
             import re as _re_addr
 
+            store_lines: List[str] = []
             _addr_haystack = query + " " + " ".join(
                 _entry_text(m) for m in ((context or {}).get("history") or [])[-6:]
             )
+            _seen_addrs = set()
             for _addr in _re_addr.findall(r"[\w.+-]+@[\w.-]+", _addr_haystack):
+                if _addr.lower() in _seen_addrs:
+                    continue
+                _seen_addrs.add(_addr.lower())
                 for _line in _search_ingested_by_address(user_id, _addr):
                     if _line not in store_lines:
                         store_lines.append(_line)
@@ -1263,6 +1267,42 @@ async def execute_tool_plan(
                             break
                 if len(store_lines) >= 6:
                     break
+
+            # SECOND SOURCE — the ingested mailbox memory via hybrid search.
+            # Graph free-text $search does not reliably match sender
+            # ADDRESSES or nicknames (live 2026-09-02: "find Jason's
+            # response" — the sender is "Jacob" Schulz, and the address
+            # local-part 'jschulz' never matched), while the ingested copy
+            # carries the full content plus sender/recipient fields. The
+            # deterministic scan above already covers address-shaped needs;
+            # this (embedding init + vector search — a real contributor to
+            # exec timeouts under load, live 2026-09-06) only fills the
+            # slots nicknames/semantic misses leave open.
+            if len(store_lines) < 4:
+                try:
+                    from core.hybrid_search.documents_hybrid import (
+                        DocumentsHybridSearch,
+                    )
+
+                    store_result = await DocumentsHybridSearch().search(
+                        query=query[:200], limit=6, owner_user_id=user_id
+                    )
+                    for hit in (store_result or {}).get("results") or []:
+                        if str(hit.get("source") or "") != "communication":
+                            continue
+                        sender = str(hit.get("sender") or "?")
+                        title = str(hit.get("title") or "")
+                        snippet = str(hit.get("preview") or "")[:220]
+                        ts = str(hit.get("as_of") or "")
+                        line = (
+                            f"- [ingested mailbox] From: {sender} | {title} | {snippet} | {ts}"
+                        )
+                        if line not in store_lines:
+                            store_lines.append(line)
+                        if len(store_lines) >= 6:
+                            break
+                except Exception as store_err:
+                    logger.debug(f"comms-store supplement skipped: {store_err}")
 
             if not emails and not store_lines:
                 # A mailbox miss is not the whole story: the question may be
@@ -1284,15 +1324,22 @@ async def execute_tool_plan(
                     f"LIVE TOOL RESULTS (outlook.search_emails, query='{query}'): "
                     "no matching messages in the mailbox or ingested memory."
                 )
-            listing = "\n".join(
+            # Deterministic thread-member lines LEAD the block: for an
+            # address query, Graph's relevance ranking fills its slots with
+            # unrelated recent mail (live 2026-09-06: Zoho lead forms for a
+            # different customer), and the reply model anchors on the first
+            # lines it reads — run 1 echoed that junk and declared the
+            # thread nonexistent while the real messages sat further down.
+            listing = "\n".join(store_lines)
+            graph_listing = "\n".join(
                 f"- From: {((e.get('from_field') or {}).get('emailAddress') or {}).get('address') or '?'} | "
                 f"{str(e.get('subject') or '(no subject)')[:120]} | "
                 f"{str(e.get('body_preview') or '')[:200]} | "
                 f"received: {str(e.get('received_date_time'))[:19]}"
                 for e in emails[:6]
             )
-            if store_lines:
-                listing = (listing + "\n" if listing else "") + "\n".join(store_lines)
+            if graph_listing:
+                listing = (listing + "\n" if listing else "") + graph_listing
             return _with_grounding(
                 f"LIVE TOOL RESULTS (outlook.search_emails, query='{query}') — "
                 f"use these to answer:\n{listing}"

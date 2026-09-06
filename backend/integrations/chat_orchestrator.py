@@ -295,6 +295,23 @@ def _reply_claims_inability(text: str) -> bool:
     return bool(_INABILITY_RE.search(text))
 
 
+def _tool_failure_block(planned: str) -> str:
+    """Prompt block injected when a PLANNED live lookup failed or timed out.
+
+    Silently dropping the block (the old behavior) reads to the model as
+    "no tool ran, therefore no tool exists": it told the user it had no
+    Outlook search tool (live 2026-09-06, right after the same lookup had
+    succeeded the turn before). An explicit failure block keeps the reply
+    truthful about what happened instead."""
+    return (
+        f"LIVE TOOL RESULTS ({planned}): the live lookup FAILED (timed out or "
+        "errored) — you DID attempt it. Tell the user the live lookup could not "
+        "complete right now and suggest trying again in a moment. Do NOT claim "
+        "you lack tools or integrations, and do NOT claim the data does not "
+        "exist — those are both false."
+    )
+
+
 class ChatOrchestrator:
     """
     Main orchestrator that connects chat interface with all ATOM features
@@ -1478,7 +1495,12 @@ When users ask to fetch live data (like CRM leads), acknowledge that the integra
                     await _trace("thought", {"tool": "tool_planner", "params": {}},
                                  f"No live lookup needed: {(_plan.reason or 'conversation suffices')[:160]}")
             except Exception as tool_err:
-                logger.warning(f"tool planning skipped: {tool_err}")
+                # !r, not str: a bare asyncio.TimeoutError() stringifies to
+                # "" — the old warning printed "tool planning skipped: " and
+                # hid the 45s exec timeout entirely (live 2026-09-06).
+                logger.warning(f"tool planning skipped: {tool_err!r}")
+                if _planned and not _tool_block:
+                    _tool_block = _tool_failure_block(_planned)
 
             # Add conversation history. When fresh tool results exist for
             # this turn, include ONLY the user turns as context: measured
