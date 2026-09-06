@@ -261,3 +261,13 @@ frontend catch swallowed it). Auto-extraction is now age-budgeted:
 `ATOM_KG_EXTRACT_MAX_AGE_DAYS` (default 30, 0 = unlimited). Older backfill
 is indexed and searchable but does not fire LLM extraction. The frontend
 to-canvas handlers now toast on failure instead of an empty catch.
+
+**Chat-path sync scans off the loop (2026-09-06, generalized):** the
+SYNC-OFF-LOOP pattern now covers the shared chat tool planner. The comms
+address scan (`_search_ingested_by_address` — full-table walk, ~4s at 3.5k
+rows), the exact-token scan, and the documents-table excerpt loader all run
+via `asyncio.to_thread`; the excerpt loader is additionally batched to ONE
+table load per memory search (it previously re-loaded the full documents
+table PER HIT, up to 8 loads per query, on the loop). The loop-stall
+regression test (`test_mailbox_lines_offload_keeps_loop_responsive`) fails
+if a scan ever goes back on-loop.

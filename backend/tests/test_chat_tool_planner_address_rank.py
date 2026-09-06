@@ -100,3 +100,49 @@ class TestToolFailureBlock:
         assert "lack tools" in block
         assert "does not exist" in block
         assert "FAILED" in block
+
+
+# --- SYNC-OFF-LOOP: the scans must not block the event loop ----------------
+
+def test_mailbox_lines_offload_keeps_loop_responsive(monkeypatch):
+    """The comms-table scan is a ~4s full-table walk at real size. It must
+    run in a worker thread: while it runs, the event loop keeps servicing
+    other tasks (live 2026-09-06: on-loop scans froze every endpoint)."""
+    import asyncio
+    import time
+    import core.chat_tool_planner as planner
+
+    def slow_scan(user_id, address, limit=4):
+        time.sleep(0.4)
+        return ["- [ingested mailbox] hit"]
+
+    monkeypatch.setattr(planner, "_search_ingested_by_address", slow_scan)
+
+    async def harness():
+        ticks = []
+        stop = False
+
+        async def tick():
+            while not stop:
+                ticks.append(time.monotonic())
+                await asyncio.sleep(0.02)
+
+        ticker = asyncio.create_task(tick())
+        t0 = time.monotonic()
+        lines = await planner._ingested_mailbox_lines(
+            "u1", "jschulz@blumetric.ca", {"history": []})
+        elapsed = time.monotonic() - t0
+        stop = True
+        await ticker
+        return lines, elapsed, ticks
+
+    lines, elapsed, ticks = asyncio.run(harness())
+    assert lines  # scan results still surface
+    # the loop ticked DURING the 0.4s scan: gaps between ticks stay small
+    # (the mocked 0.4s scan stands in for the real ~4s full-table walk; an
+    # on-loop scan would stall the loop for the whole duration). The single
+    # ~0.3s tail gap is the hybrid-fallback leg scheduling at the end.
+    gaps = [b - a for a, b in zip(ticks, ticks[1:])]
+    assert max(gaps) < 0.5, f"event loop stalled {max(gaps):.2f}s during scan"
+    assert sum(1 for g in gaps if g < 0.05) >= 10, "loop did not tick during scan"
+    assert elapsed >= 0.4

@@ -746,7 +746,10 @@ async def _ingested_mailbox_lines(
         if _addr.lower() in _seen_addrs:
             continue
         _seen_addrs.add(_addr.lower())
-        for _line in _search_ingested_by_address(user_id, _addr):
+        # SYNC-OFF-LOOP: the scan loads and walks the whole comms table
+        # (~4s at 3.5k rows, live 2026-09-06) — on the loop it froze every
+        # concurrent request for that long, per address.
+        for _line in await asyncio.to_thread(_search_ingested_by_address, user_id, _addr):
             if _line not in store_lines:
                 store_lines.append(_line)
                 if len(store_lines) >= cap:
@@ -983,20 +986,31 @@ def _best_content_excerpt(content: str, query: str, width: int = 500) -> str:
     return "\n".join(parts)
 
 
-def _doc_hit_excerpt(doc_id: str, query: str, fallback: str, width: int = 600) -> tuple:
+def _load_documents_df():
+    """SYNC (callers must to_thread): full documents table for excerpt
+    extraction — a file-ingest table with full text can be large, so this
+    load is the expensive part and must run once per search, not per hit."""
+    import lancedb
+
+    base = Path(__file__).resolve().parent.parent / "data" / "atom_memory"
+    table = lancedb.connect(str(base / "default")).open_table("documents")
+    return table.to_arrow().to_pandas()
+
+
+def _doc_hit_excerpt(doc_id: str, query: str, fallback: str, width: int = 600,
+                     df: Any = None) -> tuple:
     """Query-anchored excerpt from the FULL stored text of a file-ingest row
     (documents table), with the ingestion date for freshness stamping.
     Falls back to the short preview for rows that are not LanceDB file
     ingests (PG-bridged records, conversations). Returns (excerpt, ingested_date).
     Pricing/values can change at the source — the date is what lets the
-    agent (and the user) see how fresh a quoted figure is."""
+    agent (and the user) see how fresh a quoted figure is. Pass a preloaded
+    ``df`` (see _load_documents_df) when extracting several hits: one table
+    load per search, not per hit."""
     ingested_date = ""
     try:
-        import lancedb
-
-        base = Path(__file__).resolve().parent.parent / "data" / "atom_memory"
-        table = lancedb.connect(str(base / "default")).open_table("documents")
-        df = table.to_arrow().to_pandas()
+        if df is None:
+            df = _load_documents_df()
         ids = df["id"].astype(str)
         rows = df[ids == str(doc_id)]
         if rows.empty:
@@ -1049,6 +1063,10 @@ async def _memory_search_block(
         )
         lines: List[str] = []
         seen_ids = set()
+        # SYNC-OFF-LOOP: excerpt extraction needs the FULL documents table —
+        # load it once, off-loop (it was previously a full table load PER
+        # HIT, up to 8 loads per search, all on the event loop).
+        _doc_df = await asyncio.to_thread(_load_documents_df)
         for hit in (result or {}).get("results") or []:
             hid = str(hit.get("id") or "")
             if hid in seen_ids:
@@ -1061,7 +1079,7 @@ async def _memory_search_block(
             # only ever showed a document's head, hiding pricing tabs and
             # formulas that live mid-file in single-row ingests.
             body, ingested_on = _doc_hit_excerpt(
-                hid, excerpt_corpus, fallback_preview
+                hid, excerpt_corpus, fallback_preview, df=_doc_df
             )
             body = body.replace("\n", " | ")
             source = str(hit.get("source") or hit.get("title") or "record")
@@ -1092,7 +1110,8 @@ async def _memory_search_block(
             _entry_text(m) for m in ((context or {}).get("history") or [])[-6:]
         )
         for _addr in _re_addr.findall(r"[\w.+-]+@[\w.-]+", _hay):
-            for _line in _search_ingested_by_address(user_id, _addr):
+            # SYNC-OFF-LOOP: full comms-table scan per address (~4s at 3.5k rows).
+            for _line in await asyncio.to_thread(_search_ingested_by_address, user_id, _addr):
                 if _line not in lines:
                     lines.append(_line)
                     if len(lines) >= 8:
@@ -1104,8 +1123,8 @@ async def _memory_search_block(
         # it must not be cut by the 8-line cap when the hybrid legs already
         # filled the block.
         exact_lines = [
-            _l for _l in _search_ingested_by_exact_token(
-                user_id, query, skip_ids=seen_ids)
+            _l for _l in await asyncio.to_thread(
+                _search_ingested_by_exact_token, user_id, query, skip_ids=seen_ids)
             if _l not in lines
         ]
         if exact_lines:
