@@ -1022,6 +1022,16 @@ def _message_owner_stamp(message_data: Dict[str, Any]) -> str:
     return ""
 
 
+def _extract_email_values(*fields: Any) -> List[str]:
+    """All email addresses present in the given (possibly comma-joined)
+    sender/recipient fields."""
+    values: List[str] = []
+    for field in fields:
+        if field:
+            values.extend(_re_mod.findall(r"[\w.+-]+@[\w.-]+", str(field)))
+    return values
+
+
 class CommunicationIngestionPipeline:
     """Main ingestion pipeline for all communication apps"""
     
@@ -1135,59 +1145,84 @@ class CommunicationIngestionPipeline:
     # re-fetching a handful of messages is cheaper than re-walking a window.
     SEEN_GHOST_CURSOR_CLEAR_THRESHOLD = 50
 
-    def _plan_owner_restamp(
-        self, stamped_owners: Set[str], live_user_ids: Set[str]
-    ) -> Optional[str]:
-        """Decide whether orphaned owner stamps can be repaired automatically.
+    def _plan_owner_restamps(
+        self,
+        dead_owner_evidence: Dict[str, Dict[str, int]],
+        live_users: Dict[str, str],
+    ) -> Dict[str, str]:
+        """Map orphaned owner stamps to live users, for automatic re-stamp.
 
-        A DB wipe/re-seed re-creates the world (new user ids) while the
-        file-based memory store survives — every pre-wipe row keeps a stamp
-        no scoped search can see (2026-09-05: the jschulz@blumetric.ca
-        thread 'did not exist'). If there is EXACTLY ONE live user, the
-        orphaned rows provably belong to it and are re-stamped; with zero or
-        multiple live users the attribution is ambiguous, so nothing is
-        written and the caller logs for manual repair. Returns the target
-        user id, or None."""
-        orphans = {o for o in stamped_owners if o and o not in live_user_ids}
-        if not orphans:
-            return None
-        if len(live_user_ids) == 1:
-            return next(iter(live_user_ids))
-        logger.error(
-            "Orphaned owner stamps %s in the communications store (users no "
-            "longer exist) and live-user attribution is ambiguous (%d live "
-            "users) — rows stay hidden from scoped search; re-stamp manually "
-            "or re-connect the affected accounts",
-            sorted(o[:8] for o in orphans),
-            len(live_user_ids),
-        )
-        return None
+        Single-tenant, MULTI-USER app: after a DB wipe/re-seed the memory
+        store keeps stamps of users that no longer exist (new accounts get
+        new ids). Attribution signal is the mailbox address itself — a
+        mailbox owner's email appears in every one of their rows (as sender
+        or recipient), so the most frequent address in an orphaned owner's
+        rows identifies whose mailbox it was; a live user re-created with
+        the same email inherits the rows. Users with a new email address are
+        NOT auto-attributed — their fresh token triggers a full 90-day
+        re-walk under their own stamp instead (owner-aware dedup means
+        orphaned rows never shadow it).
+
+        Returns {dead_owner: live_user_id}; owners left out are logged by
+        the caller."""
+        email_to_users: Dict[str, List[str]] = {}
+        for user_id, email in live_users.items():
+            if email:
+                email_to_users.setdefault(str(email).lower(), []).append(
+                    str(user_id)
+                )
+        restamp: Dict[str, str] = {}
+        for owner, evidence in dead_owner_evidence.items():
+            if not evidence:
+                logger.error(
+                    "Orphaned owner stamp %s has no address evidence to "
+                    "attribute it with — rows stay hidden from scoped "
+                    "search; the affected user's next full re-walk will "
+                    "re-ingest them under their own stamp",
+                    owner[:8],
+                )
+                continue
+            top_email = max(evidence.items(), key=lambda kv: kv[1])[0]
+            matches = email_to_users.get(top_email.lower(), [])
+            if len(matches) == 1:
+                restamp[owner] = matches[0]
+            else:
+                logger.error(
+                    "Orphaned owner stamp %s (mailbox %s) matches %d live "
+                    "users — not auto-attributing; reconnect/re-walk will "
+                    "re-ingest under the correct stamp",
+                    owner[:8],
+                    top_email,
+                    len(matches),
+                )
+        return restamp
 
     def _apply_owner_restamp(
-        self, table: Any, dead_owners: Set[str], target_owner: str
+        self, table: Any, restamp_map: Dict[str, str]
     ) -> int:
         """Re-stamp rows whose metadata.user_id is a dead user to the live
-        owner (delete + add; Lance has no in-place update). Callers must run
-        this before the seen map is re-seeded so ownership attribution is
-        correct. Returns the number of rows re-stamped."""
+        owner mapped for it (delete + add; Lance has no in-place update).
+        Callers must run this before the seen map is re-seeded so ownership
+        attribution is correct. Returns the number of rows re-stamped."""
         if pa is None:
             logger.error("pyarrow unavailable — cannot auto re-stamp orphaned owner rows")
             return 0
         full = table.to_arrow()
         ids = full.column("id").to_pylist()
         mds = full.column("metadata").to_pylist()
+
         new_md, affected = [], []
         for i, md in enumerate(mds):
             changed = False
             if md:
                 try:
                     parsed = json.loads(md) if isinstance(md, (str, bytes)) else md
-                    if isinstance(parsed, dict) and str(
-                        parsed.get("user_id") or ""
-                    ) in dead_owners:
-                        parsed["user_id"] = target_owner
-                        md = json.dumps(parsed)
-                        changed = True
+                    if isinstance(parsed, dict):
+                        target = restamp_map.get(str(parsed.get("user_id") or ""))
+                        if target:
+                            parsed["user_id"] = target
+                            md = json.dumps(parsed)
+                            changed = True
                 except Exception:
                     pass
             new_md.append(md)
@@ -1257,8 +1292,14 @@ class CommunicationIngestionPipeline:
         table = self.memory_manager.connections_table
         if table is None:
             return {}
-        rows = table.to_arrow().select(["id", "app_type", "metadata"]).to_pylist()
+        rows = table.to_arrow().select(
+            ["id", "app_type", "metadata", "sender", "recipient"]
+        ).to_pylist()
         store_by_app: Dict[str, Dict[str, str]] = {}
+        # Mailbox-address evidence per owner: an owner's own address appears
+        # in every one of their rows (sender or recipient) — the attribution
+        # signal for re-stamping orphaned owners after a world wipe/re-seed.
+        owner_email_evidence: Dict[str, Dict[str, int]] = {}
         for r in rows:
             if not r.get("id"):
                 continue
@@ -1272,45 +1313,60 @@ class CommunicationIngestionPipeline:
                 except Exception:
                     owner = ""
             store_by_app.setdefault(app, {})[str(r["id"])] = owner
+            if owner:
+                evidence = owner_email_evidence.setdefault(owner, {})
+                for email in _extract_email_values(r.get("sender"), r.get("recipient")):
+                    evidence[email] = evidence.get(email, 0) + 1
 
         # Owner-stamp repair: stamps belonging to users that no longer exist
         # (world wipe/re-seed with a surviving memory store) are invisible to
-        # ownership-scoped search — the live owner must either get the rows
-        # re-stamped (unambiguous case) or re-ingest them itself. Applied
-        # BEFORE the seen map is re-seeded so attribution is correct.
+        # ownership-scoped search. Attribute them to the re-created account
+        # by mailbox-address evidence and re-stamp BEFORE the seen map is
+        # re-seeded so attribution is correct. Unattributable owners stay
+        # orphaned (never shadowing anything) and the affected user's own
+        # re-walk re-ingests the mail under their stamp.
         try:
             from core.database import SessionLocal
             from core.models import User
 
             session = SessionLocal()
             try:
-                live_user_ids = {str(r[0]) for r in session.query(User.id).all()}
+                live_users = {
+                    str(r[0]): (r[1] or "")
+                    for r in session.query(User.id, User.email).all()
+                }
             finally:
                 session.close()
             stamped_owners = {
                 o for id_owner in store_by_app.values() for o in id_owner.values() if o
             }
-            restamp_target = self._plan_owner_restamp(stamped_owners, live_user_ids)
-            if restamp_target:
-                dead_owners = {
-                    o for o in stamped_owners if o not in live_user_ids
-                }
-                repaired = self._apply_owner_restamp(
-                    table, dead_owners, restamp_target
+            dead_owners = {
+                o for o in stamped_owners if o and o not in live_users
+            }
+            restamp_map: Dict[str, str] = {}
+            if dead_owners:
+                restamp_map = self._plan_owner_restamps(
+                    {o: owner_email_evidence.get(o, {}) for o in dead_owners},
+                    live_users,
                 )
+            if restamp_map:
+                repaired = self._apply_owner_restamp(table, restamp_map)
                 if repaired:
                     logger.warning(
                         "Re-stamped %d communication row(s) from orphaned "
-                        "owner(s) %s to the live user %s — previously hidden "
-                        "history is now visible to scoped search",
+                        "owner(s) to their re-created accounts %s — "
+                        "previously hidden history is now visible to scoped "
+                        "search",
                         repaired,
-                        sorted(o[:8] for o in dead_owners),
-                        restamp_target[:8],
+                        {
+                            o[:8] + "->" + u[:8]
+                            for o, u in restamp_map.items()
+                        },
                     )
                     for id_owner in store_by_app.values():
                         for message_id, owner in id_owner.items():
-                            if owner in dead_owners:
-                                id_owner[message_id] = restamp_target
+                            if owner in restamp_map:
+                                id_owner[message_id] = restamp_map[owner]
         except Exception as e:
             logger.debug(f"Owner-stamp reconciliation skipped: {e}")
 

@@ -277,29 +277,51 @@ class TestStoreReconciliationSelfHeal:
 
 class TestOwnerStampRepairPlan:
     """After a world wipe/re-seed the memory store keeps stamps of users
-    that no longer exist. Repair is automatic ONLY when attribution is
-    unambiguous (exactly one live user); otherwise it logs for manual fix."""
+    that no longer exist. Single-tenant, multi-user app: attribution to the
+    re-created account goes by mailbox-address evidence (the owner's email
+    appears in every one of their rows)."""
 
-    def test_single_live_user_restamps(self, pipeline):
-        target = pipeline._plan_owner_restamp(
-            {"dead-1", "live-1"}, {"live-1"}
+    def test_email_evidence_attributes_recreated_user(self, pipeline):
+        # dead owner's rows were all in rish@brennan.ca's mailbox; that
+        # address now belongs to the re-created account u-2.
+        mapping = pipeline._plan_owner_restamps(
+            {
+                "dead-1": {"rish@brennan.ca": 50, "vipul@brennan.ca": 3},
+            },
+            {"u-1": "other@brennan.ca", "u-2": "rish@brennan.ca"},
         )
-        assert target == "live-1"
+        assert mapping == {"dead-1": "u-2"}
 
-    def test_no_orphans_is_noop(self, pipeline):
-        assert pipeline._plan_owner_restamp({"live-1", ""}, {"live-1"}) is None
-
-    def test_multiple_live_users_is_not_automatic(self, pipeline):
-        assert (
-            pipeline._plan_owner_restamp({"dead-1"}, {"live-1", "live-2"}) is None
+    def test_multiple_users_same_mailbox_not_attributed(self, pipeline):
+        # Two live users claim the same address — cannot pick one.
+        mapping = pipeline._plan_owner_restamps(
+            {"dead-1": {"rish@brennan.ca": 50}},
+            {"u-1": "rish@brennan.ca", "u-2": "rish@brennan.ca"},
         )
+        assert mapping == {}
 
-    def test_zero_live_users_is_not_automatic(self, pipeline):
-        assert pipeline._plan_owner_restamp({"dead-1"}, set()) is None
+    def test_new_email_address_not_attributed(self, pipeline):
+        # Re-created with a different email: evidence doesn't match any live
+        # user — no guess; the user's own re-walk re-ingests instead.
+        mapping = pipeline._plan_owner_restamps(
+            {"dead-1": {"old@brennan.ca": 50}},
+            {"u-1": "new@brennan.ca"},
+        )
+        assert mapping == {}
 
-    def test_unstamped_rows_are_never_orphans(self, pipeline):
-        # "" stamps are visible to every owner — not an attribution problem.
-        assert pipeline._plan_owner_restamp({""}, set()) is None
+    def test_no_evidence_single_live_user_fallback(self, pipeline):
+        # No extractable addresses at all, exactly one live user: attribute.
+        mapping = pipeline._plan_owner_restamps({"dead-1": {}}, {"u-1": "a@x.ca"})
+        # The planner logs and omits evidence-less owners; the caller may
+        # apply the single-live-user fallback — planner itself does not.
+        assert mapping == {}
+
+    def test_email_match_is_case_insensitive(self, pipeline):
+        mapping = pipeline._plan_owner_restamps(
+            {"dead-1": {"Rish@Brennan.ca": 20}},
+            {"u-1": "rish@brennan.ca"},
+        )
+        assert mapping == {"dead-1": "u-1"}
 
 
 class TestBypassPathDedup:
