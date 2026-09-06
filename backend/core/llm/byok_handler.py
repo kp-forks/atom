@@ -1870,7 +1870,25 @@ class BYOKHandler:
                     QueryComplexity.SIMPLE: 85,
                     QueryComplexity.MODERATE: 80,
                     QueryComplexity.COMPLEX: 88,
-                    QueryComplexity.ADVANCED: 94
+                    # ADVANCED was 94 (frontier-only): the only vetted models
+                    # clearing it were qwen3-max ($2.34/M blended) and
+                    # deepseek-v4-pro — so every "advanced"-classified request
+                    # paid flagship prices. Recalibrated to 90 (Sept 6): the
+                    # 2026 flash tier now benchmarks at last-gen-flagship
+                    # level (gemini-3-flash beats o3/GPT-5 on a medical
+                    # accuracy battery, PMC12894337; gpt-5-mini = 99.3% of
+                    # gpt-5 quality at 4.2x lower cost, Wolfia), and BOTH
+                    # passed the same Aug-30 transcript-recall probe that set
+                    # the SIMPLE floor (scripts/bpc_recall_probe_sept2026.py;
+                    # glm-5.3-flash / qwen3.8-flash / v4-flash-0731 failed it
+                    # and stay below 85). 90 keeps the line at "frontier-class
+                    # or measured-equivalent" — minimax-m3 (89, no external
+                    # frontier-class evidence) still tops out at COMPLEX.
+                    # Result: advanced -> gpt-5-mini ($1.13/M blended,
+                    # recall ✓) instead of qwen3-max ($2.34/M); deepseek BYOK
+                    # advanced -> deepseek-reasoner (91, $0.35/M, recall ✓
+                    # probed Sept 6) instead of deepseek-v4-pro ($2.64/M).
+                    QueryComplexity.ADVANCED: 90
                 }
                 min_quality = MIN_QUALITY_BY_COMPLEXITY.get(complexity, 0)
             
@@ -1930,8 +1948,22 @@ class BYOKHandler:
             for model_id, pricing in fetcher.pricing_cache.items():
                 litellm_provider = pricing.get("litellm_provider", "").lower()
 
-                # Check if we have a client for this provider
-                active_provider = next((p for p in available_providers if p in model_id.lower() or p == litellm_provider), None)
+                # Check if we have a client for this provider. Exact catalog
+                # match wins: OpenRouter-hosted IDs often CONTAIN another
+                # client's name ("deepseek/deepseek-v4-flash-0731" contains
+                # "deepseek"), and the old substring-first match handed those
+                # to the wrong client — api.deepseek.com 400s prefixed IDs
+                # ("supported names are deepseek-v4-pro, deepseek-v4-flash,
+                # …", verified Sept 6), so every such request paid a failed
+                # call before escalating. Substring stays as the fallback for
+                # models the catalog can't attribute (local providers).
+                active_provider = next(
+                    (p for p in available_providers if p == litellm_provider), None
+                )
+                if not active_provider:
+                    active_provider = next(
+                        (p for p in available_providers if p in model_id.lower()), None
+                    )
                 if not active_provider:
                     continue
 
