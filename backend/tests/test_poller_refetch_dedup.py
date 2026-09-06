@@ -275,6 +275,33 @@ class TestStoreReconciliationSelfHeal:
         assert [m["id"] for m in fresh_dead] == ["m-2"]
 
 
+class TestOwnerStampRepairPlan:
+    """After a world wipe/re-seed the memory store keeps stamps of users
+    that no longer exist. Repair is automatic ONLY when attribution is
+    unambiguous (exactly one live user); otherwise it logs for manual fix."""
+
+    def test_single_live_user_restamps(self, pipeline):
+        target = pipeline._plan_owner_restamp(
+            {"dead-1", "live-1"}, {"live-1"}
+        )
+        assert target == "live-1"
+
+    def test_no_orphans_is_noop(self, pipeline):
+        assert pipeline._plan_owner_restamp({"live-1", ""}, {"live-1"}) is None
+
+    def test_multiple_live_users_is_not_automatic(self, pipeline):
+        assert (
+            pipeline._plan_owner_restamp({"dead-1"}, {"live-1", "live-2"}) is None
+        )
+
+    def test_zero_live_users_is_not_automatic(self, pipeline):
+        assert pipeline._plan_owner_restamp({"dead-1"}, set()) is None
+
+    def test_unstamped_rows_are_never_orphans(self, pipeline):
+        # "" stamps are visible to every owner — not an attribution problem.
+        assert pipeline._plan_owner_restamp({""}, set()) is None
+
+
 class TestBypassPathDedup:
     """Ingestion paths that bypass the poll loop (webhook handler, telegram
     polling worker) must honor the same mark-after-success dedup contract —

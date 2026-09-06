@@ -1135,6 +1135,85 @@ class CommunicationIngestionPipeline:
     # re-fetching a handful of messages is cheaper than re-walking a window.
     SEEN_GHOST_CURSOR_CLEAR_THRESHOLD = 50
 
+    def _plan_owner_restamp(
+        self, stamped_owners: Set[str], live_user_ids: Set[str]
+    ) -> Optional[str]:
+        """Decide whether orphaned owner stamps can be repaired automatically.
+
+        A DB wipe/re-seed re-creates the world (new user ids) while the
+        file-based memory store survives — every pre-wipe row keeps a stamp
+        no scoped search can see (2026-09-05: the jschulz@blumetric.ca
+        thread 'did not exist'). If there is EXACTLY ONE live user, the
+        orphaned rows provably belong to it and are re-stamped; with zero or
+        multiple live users the attribution is ambiguous, so nothing is
+        written and the caller logs for manual repair. Returns the target
+        user id, or None."""
+        orphans = {o for o in stamped_owners if o and o not in live_user_ids}
+        if not orphans:
+            return None
+        if len(live_user_ids) == 1:
+            return next(iter(live_user_ids))
+        logger.error(
+            "Orphaned owner stamps %s in the communications store (users no "
+            "longer exist) and live-user attribution is ambiguous (%d live "
+            "users) — rows stay hidden from scoped search; re-stamp manually "
+            "or re-connect the affected accounts",
+            sorted(o[:8] for o in orphans),
+            len(live_user_ids),
+        )
+        return None
+
+    def _apply_owner_restamp(
+        self, table: Any, dead_owners: Set[str], target_owner: str
+    ) -> int:
+        """Re-stamp rows whose metadata.user_id is a dead user to the live
+        owner (delete + add; Lance has no in-place update). Callers must run
+        this before the seen map is re-seeded so ownership attribution is
+        correct. Returns the number of rows re-stamped."""
+        if pa is None:
+            logger.error("pyarrow unavailable — cannot auto re-stamp orphaned owner rows")
+            return 0
+        full = table.to_arrow()
+        ids = full.column("id").to_pylist()
+        mds = full.column("metadata").to_pylist()
+        new_md, affected = [], []
+        for i, md in enumerate(mds):
+            changed = False
+            if md:
+                try:
+                    parsed = json.loads(md) if isinstance(md, (str, bytes)) else md
+                    if isinstance(parsed, dict) and str(
+                        parsed.get("user_id") or ""
+                    ) in dead_owners:
+                        parsed["user_id"] = target_owner
+                        md = json.dumps(parsed)
+                        changed = True
+                except Exception:
+                    pass
+            new_md.append(md)
+            if changed:
+                affected.append(str(ids[i]))
+        if not affected:
+            return 0
+        idx = full.schema.get_field_index("metadata")
+        repaired = full.set_column(
+            idx, full.schema.field(idx), pa.array(new_md, type=full.schema.field(idx).type)
+        )
+        affected_set = set(affected)
+        subset = repaired.filter(
+            pa.array([str(v) in affected_set for v in ids])
+        )
+        for start in range(0, len(affected), 80):
+            chunk = affected[start : start + 80]
+            predicate = (
+                "id IN ("
+                + ",".join("'" + x.replace("'", "") + "'" for x in chunk)
+                + ")"
+            )
+            table.delete(predicate)
+        table.add(subset)
+        return len(affected)
+
     def _clear_cursors_for_app(self, app_type: str) -> int:
         """Drop every fetch cursor belonging to one app: the exact
         ``last_fetch_<app>`` key plus per-owner / continuation keys such as
@@ -1193,6 +1272,47 @@ class CommunicationIngestionPipeline:
                 except Exception:
                     owner = ""
             store_by_app.setdefault(app, {})[str(r["id"])] = owner
+
+        # Owner-stamp repair: stamps belonging to users that no longer exist
+        # (world wipe/re-seed with a surviving memory store) are invisible to
+        # ownership-scoped search — the live owner must either get the rows
+        # re-stamped (unambiguous case) or re-ingest them itself. Applied
+        # BEFORE the seen map is re-seeded so attribution is correct.
+        try:
+            from core.database import SessionLocal
+            from core.models import User
+
+            session = SessionLocal()
+            try:
+                live_user_ids = {str(r[0]) for r in session.query(User.id).all()}
+            finally:
+                session.close()
+            stamped_owners = {
+                o for id_owner in store_by_app.values() for o in id_owner.values() if o
+            }
+            restamp_target = self._plan_owner_restamp(stamped_owners, live_user_ids)
+            if restamp_target:
+                dead_owners = {
+                    o for o in stamped_owners if o not in live_user_ids
+                }
+                repaired = self._apply_owner_restamp(
+                    table, dead_owners, restamp_target
+                )
+                if repaired:
+                    logger.warning(
+                        "Re-stamped %d communication row(s) from orphaned "
+                        "owner(s) %s to the live user %s — previously hidden "
+                        "history is now visible to scoped search",
+                        repaired,
+                        sorted(o[:8] for o in dead_owners),
+                        restamp_target[:8],
+                    )
+                    for id_owner in store_by_app.values():
+                        for message_id, owner in id_owner.items():
+                            if owner in dead_owners:
+                                id_owner[message_id] = restamp_target
+        except Exception as e:
+            logger.debug(f"Owner-stamp reconciliation skipped: {e}")
 
         report: Dict[str, int] = {}
         with self._seen_state_lock:
@@ -1255,7 +1375,8 @@ class CommunicationIngestionPipeline:
             # historically preceded table data loss), so a rebuild or store
             # fork mid-process heals without waiting for a restart. Runs for
             # every polled app; only apps with ghost ids get their windows
-            # re-walked.
+            # re-walked. Owner-stamp repair (orphaned stamps after a world
+            # wipe/re-seed) rides on the same reconciliation.
             try:
                 report = await asyncio.to_thread(self._reconcile_seen_ids_with_store)
                 if report:
@@ -1263,6 +1384,16 @@ class CommunicationIngestionPipeline:
                     self._save_fetch_state()
             except Exception as e:
                 logger.warning(f"Seen-id reconciliation failed: {e}")
+            # Periodic token rectification: tokens orphaned by a wipe/re-seed
+            # are deactivated and stale-expired ones reported for reconnect.
+            try:
+                from core.integration_startup_reconciliation import (
+                    reconcile_integration_tokens,
+                )
+
+                await asyncio.to_thread(reconcile_integration_tokens)
+            except Exception as e:
+                logger.warning(f"Token reconciliation failed: {e}")
             await asyncio.sleep(interval_hours * 3600)
 
     def configure_app(self, app_type: CommunicationAppType, config: IngestionConfig):

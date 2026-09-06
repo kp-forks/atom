@@ -684,6 +684,19 @@ async def lifespan(app: FastAPI):
         # email agent (core.email_agent) handles inbox work through MCP gates
         # instead, triggered by the Outlook webhook (ingestion_webhooks).
 
+        # Integration token reconciliation (all providers): tokens pointing
+        # at users that no longer exist (world wipe/re-seed) would keep
+        # pollers running against dead owners and stamp ingested data no
+        # scoped search can see. Deactivates orphans, reports stale-expired.
+        try:
+            from core.integration_startup_reconciliation import (
+                reconcile_integration_tokens,
+            )
+
+            reconcile_integration_tokens()
+        except Exception as e:
+            logger.error(f"Integration token reconciliation failed: {e}")
+
         # Start Outlook Memory Poller (recover after restart when Outlook is
         # already connected). Reads tokens from IntegrationToken; skips when no
         # active outlook/microsoft token exists or the stream is already up.
