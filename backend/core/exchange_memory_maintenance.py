@@ -647,13 +647,22 @@ async def run_maintenance_cycle(db) -> Dict[str, Any]:
     try:
         from core.db_safety import maintenance_db_safety_step
 
-        summary["db_safety"] = maintenance_db_safety_step()
+        # OFF-LOOP: the sqlite snapshot copies the whole DB file; on the
+        # event loop it froze every endpoint for its duration.
+        summary["db_safety"] = await asyncio.to_thread(maintenance_db_safety_step)
     except Exception as e:
         logger.debug("db safety step failed: %s", e)
     try:
         from core.db_safety import lance_version_cleanup_step
 
-        summary["lance_cleanup"] = lance_version_cleanup_step()
+        # OFF-LOOP (wedge root cause, 2026-09-06): cleanup_old_versions is a
+        # long-running Rust operation (a busy day creates thousands of table
+        # versions) — called directly from this loop task it froze the ENTIRE
+        # event loop for minutes at a time: health probes dead, every request
+        # starved, the chat "open in canvas" button timing out silently. The
+        # faulthandler SIGUSR1 dump pinned the main thread inside
+        # lance/dataset.py cleanup_old_versions via this exact call.
+        summary["lance_cleanup"] = await asyncio.to_thread(lance_version_cleanup_step)
     except Exception as e:
         logger.debug("lance cleanup step failed: %s", e)
     return summary
