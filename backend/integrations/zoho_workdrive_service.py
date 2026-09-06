@@ -986,12 +986,12 @@ class ZohoWorkDriveService(IntegrationService):
                 role=role,
             )
 
-            if result.get("status") != "ingested":
-                # Don't mask skipped/errored parses as success — the UI must
-                # tell the user nothing was stored (e.g. unsupported format).
-                reason = result.get("reason") or result.get("status") or "unknown"
-                logger.warning(f"Ingest skipped for {file_name}: {reason}")
-                return {"success": False, "error": f"File not ingested ({reason})"}
+            # Shared semantics (core.auto_document_ingestion): a byte-identical
+            # re-ingest is a success no-op ("unchanged"), real skips stay
+            # failures — otherwise every re-ingest click showed the panel
+            # "File ingest failed".
+            from core.auto_document_ingestion import interpret_ingest_result
+            return {**interpret_ingest_result(result), "result": result}
 
             return {"success": True, "result": result}
         except Exception as e:

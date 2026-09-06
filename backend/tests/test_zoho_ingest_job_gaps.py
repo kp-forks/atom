@@ -134,3 +134,50 @@ class TestIngestedIds:
         resp = TestClient(app).post("/api/zoho-workdrive/ingested-ids",
                                     json={"file_ids": ["f1"]})
         assert resp.status_code == 401
+
+
+class TestUnchangedSkipNotFailure:
+    """Re-ingesting an already-stored, byte-identical file must succeed as a
+    no-op — previously the 'unchanged' skip surfaced to the panel as
+    'File ingest failed' (2026-09-05 live report on Consolidated Price List
+    2019.xlsx). Real skips (unsupported format, write failures) stay failures."""
+
+    @staticmethod
+    def _run_ingest(monkeypatch, process_result):
+        from unittest.mock import MagicMock
+
+        from integrations.zoho_workdrive_service import ZohoWorkDriveService
+        svc = ZohoWorkDriveService.__new__(ZohoWorkDriveService)
+        monkeypatch.setattr(svc, "get_access_token", AsyncMock(return_value="tok"))
+        monkeypatch.setattr(svc, "download_file", AsyncMock(return_value=b"bytes"))
+        meta_resp = MagicMock()
+        meta_resp.json.return_value = {"data": {"attributes": {"name": "a.xlsx"}}}
+        svc.base_url = "https://workdrive.example"
+        svc.client = MagicMock()
+        svc.client.get = AsyncMock(return_value=meta_resp)
+        monkeypatch.setattr(
+            "core.auto_document_ingestion.AutoDocumentIngestionService.process_file_bytes",
+            AsyncMock(return_value=process_result),
+        )
+        return asyncio.run(svc.ingest_file_to_memory("u", "f1"))
+
+    def test_unchanged_skip_is_success(self, monkeypatch):
+        result = self._run_ingest(monkeypatch, {
+            "status": "skipped", "reason": "unchanged", "file_name": "a.xlsx",
+        })
+        assert result["success"] is True
+        assert result["unchanged"] is True
+
+    def test_unsupported_skip_still_fails(self, monkeypatch):
+        result = self._run_ingest(monkeypatch, {
+            "status": "skipped", "reason": "unsupported_format", "file_name": "a.exe",
+        })
+        assert result["success"] is False
+        assert "unsupported_format" in result["error"]
+
+    def test_write_failed_still_fails(self, monkeypatch):
+        result = self._run_ingest(monkeypatch, {
+            "status": "skipped", "reason": "write_failed (store_error)",
+            "file_name": "a.docx",
+        })
+        assert result["success"] is False

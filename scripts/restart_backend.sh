@@ -13,7 +13,26 @@
 set -u
 
 PORT="${PORT:-8001}"
-PY="${PYTHON_BIN:-/usr/local/Cellar/python@3.11/3.11.13/Frameworks/Python.framework/Versions/3.11/Resources/Python.app/Contents/MacOS/Python}"
+# Interpreter resolution, most-specific first:
+#   1. PYTHON_BIN env — explicit override.
+#   2. This repo's known Homebrew 3.11 path (this dev machine).
+#   3. python3 from PATH — fresh installs on any machine.
+# A fresh installation must not require this exact Cellar path to exist.
+PY="${PYTHON_BIN:-}"
+if [ -z "$PY" ] && [ -x "/usr/local/Cellar/python@3.11/3.11.13/Frameworks/Python.framework/Versions/3.11/Resources/Python.app/Contents/MacOS/Python" ]; then
+    PY="/usr/local/Cellar/python@3.11/3.11.13/Frameworks/Python.framework/Versions/3.11/Resources/Python.app/Contents/MacOS/Python"
+fi
+if [ -z "$PY" ]; then
+    PY="$(command -v python3 || true)"
+fi
+if [ -z "$PY" ]; then
+    echo "FAILED: no Python interpreter found (set PYTHON_BIN=/path/to/python)" >&2
+    exit 1
+fi
+if ! "$PY" -c "import uvicorn" >/dev/null 2>&1; then
+    echo "FAILED: $PY cannot import uvicorn — run 'pip install -r backend/requirements.txt' (or set PYTHON_BIN to the env that has it)." >&2
+    exit 1
+fi
 BACKEND_DIR="$(cd "$(dirname "$0")/../backend" && pwd)"
 LOG_FILE="${LOG_FILE:-$BACKEND_DIR/logs/uvicorn_8001_restart.log}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-90}"
@@ -33,19 +52,23 @@ if [ -f "$DB_PATH" ]; then
         echo "==> DB snapshot: $SNAP.gz"
 
         # Off-machine copy: the portable drive keeps every snapshot (no
-        # 5-cap pruning) so backups survive internal-disk failure. A missing
-        # drive is a warning, never a restart failure.
-        EXT_BACKUP_DIR="/Volumes/Seagate Portable Drive/atom-backups"
-        if [ -d "/Volumes/Seagate Portable Drive" ]; then
-            mkdir -p "$EXT_BACKUP_DIR"
-            if cp "$SNAP.gz" "$EXT_BACKUP_DIR/" 2>/dev/null; then
-                ls -t "$EXT_BACKUP_DIR"/atom-*.db.gz 2>/dev/null | tail -n +31 | xargs rm -f 2>/dev/null
-                echo "==> Copied to external drive: $EXT_BACKUP_DIR/"
+        # 5-cap pruning) so backups survive internal-disk failure. The drive
+        # is OPT-IN: point ATOM_EXTERNAL_DRIVE at a mounted volume (or
+        # symlink the memory store onto one) to enable it. A fresh install
+        # without either just keeps snapshots locally — no warning.
+        EXT_DRIVE="${ATOM_EXTERNAL_DRIVE:-/Volumes/Seagate Portable Drive}"
+        MEM_LINK="$BACKEND_DIR/data/atom_memory"
+        DRIVE_CONFIGURED=$([ -n "${ATOM_EXTERNAL_DRIVE:-}" ] || [ -L "$MEM_LINK" ] && echo 1 || echo 0)
+        if [ -d "$EXT_DRIVE" ]; then
+            mkdir -p "$EXT_DRIVE/atom-backups"
+            if cp "$SNAP.gz" "$EXT_DRIVE/atom-backups/" 2>/dev/null; then
+                ls -t "$EXT_DRIVE"/atom-backups/atom-*.db.gz 2>/dev/null | tail -n +31 | xargs rm -f 2>/dev/null
+                echo "==> Copied to external drive: $EXT_DRIVE/atom-backups/"
             else
                 echo "!! WARNING: external backup copy failed (continuing)"
             fi
-        else
-            echo "!! WARNING: portable drive not mounted — snapshot kept locally only"
+        elif [ "$DRIVE_CONFIGURED" = "1" ]; then
+            echo "!! WARNING: configured external drive not mounted ($EXT_DRIVE) — snapshot kept locally only"
         fi
     else
         rm -f "$SNAP"
@@ -53,9 +76,10 @@ if [ -f "$DB_PATH" ]; then
     fi
 fi
 
-# External-store preflight: the LanceDB memory store lives on the portable
-# drive via symlink. Booting with the drive absent means "healthy but
-# memory-less" — warn loudly BEFORE starting, with recovery steps.
+# External-store preflight: when the memory store is drive-hosted (symlink),
+# booting with the drive absent means "healthy but memory-less" — warn
+# loudly BEFORE starting. A fresh local install (plain directory, no
+# symlink) needs no external drive and stays silent here.
 MEM_LINK="$BACKEND_DIR/data/atom_memory"
 if [ -L "$MEM_LINK" ] && [ ! -e "$MEM_LINK" ]; then
     echo "!! WARNING: external memory store not mounted ($MEM_LINK dangling)."

@@ -284,8 +284,10 @@ const OneDriveIntegration: React.FC = () => {
         notifyIngestionUpdated("onedrive");
         refreshRecentJobs();
         toast({
-          title: "File Ingested",
-          description: `${file.name} has been added to search index`,
+          title: data.unchanged ? "Already in Memory" : "File Ingested",
+          description: data.unchanged
+            ? `${file.name} was already in the search index — content unchanged, nothing re-ingested.`
+            : `${file.name} has been added to search index`,
         });
       } else {
         throw new Error(data.error || "Failed to ingest file");

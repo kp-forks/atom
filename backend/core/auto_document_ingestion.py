@@ -147,6 +147,34 @@ def _hashlib_sha1(value: str) -> str:
     return hashlib.sha1(value.encode("utf-8")).hexdigest()
 
 
+def interpret_ingest_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """One interpretation of a ``process_file_bytes`` result for every caller.
+
+    Drive services' ``ingest_file_to_memory``-style methods, the agent JIT
+    tool and the UI job records all need to answer the same question — did
+    the content end up in memory? — and each used to re-derive it and
+    diverge: WorkDrive reported an unchanged re-ingest as a hard failure
+    (the panel showed "File ingest failed" for a plain re-click) while
+    Box/Dropbox/Google Drive/OneDrive reported unsupported formats and store
+    write failures as success. The semantics are decided here, once:
+
+    - ``ingested``            → success (fresh content stored)
+    - ``skipped: unchanged``  → success with ``unchanged=True`` — the exact
+      content is already stored; a re-ingest is a no-op, not a failure
+    - anything else (unsupported format, ``no_text``, ``write_failed``,
+      ``parse_failed``, ``ingest_failed``) → failure with the reason
+      surfaced so the UI/agent can say what did not happen
+    """
+    status = result.get("status")
+    reason = result.get("reason") or status or "unknown"
+    if status == "ingested":
+        return {"success": True, "unchanged": False, "error": None}
+    if status == "skipped" and reason == "unchanged":
+        return {"success": True, "unchanged": True, "error": None}
+    return {"success": False, "unchanged": False,
+            "error": f"File not ingested ({reason})"}
+
+
 # Extraction budget: the cap on EXTRACTED TEXT per file (not on source
 # records). The old hard caps (5 sheets x 100 rows, 50 PDF pages, 500 docx
 # paragraphs, 1000 CSV rows) silently truncated real business files — live

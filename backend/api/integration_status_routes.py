@@ -26,6 +26,8 @@ must not be used to decide "connected" or "healthy".
 import asyncio
 import logging
 import os
+import threading
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -862,12 +864,47 @@ def _iso_or_none(value: Any) -> Optional[str]:
     return text
 
 
+_STATS_CACHE: Dict[str, Any] = {
+    "snapshot": None,
+    "refreshing": False,
+    "lock": threading.Lock(),
+}
+_STATS_REFRESH_INTERVAL = float(os.getenv("ATOM_INGESTION_STATS_TTL", "3"))
+
+
 def _ingestion_snapshot() -> Dict[str, Any]:
     """Stats from the communication memory pipeline, or an unavailable marker.
 
     Never raises — LanceDB or the pipeline being down must not 500 the
     Integrations page; the UI degrades to "ingestion unavailable".
+
+    SERVE-STALE-WHILE-REFRESH: the stats scan is a synchronous LanceDB read,
+    and on a drive-hosted store mid-ingest-backlog it can wait on the write
+    stream for a minute+ (Sep 6, 2026: the Integrations page polled this
+    endpoint every few seconds; each poll blocked the event loop on the
+    scan and stalled /api/health too). The endpoint now returns the last
+    known snapshot instantly and refreshes on a background thread every
+    _STATS_REFRESH_INTERVAL seconds. Progress dashboards tolerate seconds
+    of staleness; they do not tolerate a frozen server.
     """
+    unavailable = {
+        "available": False,
+        "active_streams": [],
+        "app_stats": {},
+    }
+    with _STATS_CACHE["lock"]:
+        cached = _STATS_CACHE["snapshot"]
+    if cached is not None:
+        return cached
+
+    # Never scan inline: the first caller returns "unavailable" and the
+    # background refresher populates the snapshot within one TTL cycle —
+    # the UI polls every few seconds, so data appears immediately after.
+    _stats_refresh_thread()
+    return unavailable
+
+
+def _build_ingestion_snapshot() -> Dict[str, Any]:
     unavailable = {
         "available": False,
         "active_streams": [],
@@ -893,6 +930,27 @@ def _ingestion_snapshot() -> Dict[str, Any]:
         "active_streams": stats.get("active_streams") or [],
         "app_stats": stats.get("app_stats") or {},
     }
+
+
+def _stats_refresh_thread() -> None:
+    def _refresh_loop():
+        # Daemon loop: refresh the shared snapshot forever. Fails soft —
+        # a failed scan keeps the last known snapshot.
+        while True:
+            time.sleep(_STATS_REFRESH_INTERVAL)
+            snapshot = _build_ingestion_snapshot()
+            with _STATS_CACHE["lock"]:
+                _STATS_CACHE["snapshot"] = snapshot
+
+    with _STATS_CACHE["lock"]:
+        already = _STATS_CACHE.get("thread_alive")
+        if not already:
+            _STATS_CACHE["thread_alive"] = True
+    if already:
+        return
+    threading.Thread(
+        target=_refresh_loop, daemon=True, name="ingestion-stats-refresh"
+    ).start()
 
 
 def _app_entry(app_stats: Dict[str, Any], app_type: str) -> Dict[str, Any]:

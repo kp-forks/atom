@@ -18,6 +18,7 @@ spot:
 
 import asyncio
 import importlib
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -114,6 +115,19 @@ def _patch_pipeline(monkeypatch, stub):
         "integrations.atom_communication_ingestion_pipeline.ingestion_pipeline",
         stub,
     )
+    # The route serves a background-refreshed snapshot and never scans
+    # inline on the request path (a sync scan on a drive-hosted store can
+    # block for minutes). Tests seed the cache directly and keep the
+    # daemon refresher out so responses are deterministic.
+    from api import integration_status_routes as _routes
+
+    monkeypatch.setattr(_routes, "_STATS_CACHE", {
+        "snapshot": None,
+        "refreshing": False,
+        "thread_alive": True,  # no background thread in tests
+        "lock": threading.Lock(),
+    })
+    _routes._STATS_CACHE["snapshot"] = _routes._build_ingestion_snapshot()
 
 
 # ---------------------------------------------------------------------------
@@ -863,3 +877,60 @@ def test_drive_ingestion_status_payload_shows_app_grid(monkeypatch):
     assert payload["app_type"] == "google_drive"
     assert payload["connected"] is True
     assert payload["ingestion_available"] is True
+
+
+# ---------------------------------------------------------------------------
+# serve-stale-while-refresh contract (Sep 6, 2026 incident)
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_returns_unavailable_without_inline_scan(monkeypatch):
+    """Cold cache must NOT scan LanceDB on the request path: the endpoint
+    answers instantly and the background refresher populates it. Regression
+    for the Sep 6 incident — with the external drive reconnected mid-backlog,
+    every ingestion-status poll blocked the event loop on a sync scan for
+    60s+ and stalled /api/health too."""
+    from api import integration_status_routes as _routes
+
+    class _SlowPipeline:
+        def get_ingestion_stats(self):
+            raise RuntimeError("scan would block for minutes")
+
+    monkeypatch.setattr(
+        "integrations.atom_communication_ingestion_pipeline.ingestion_pipeline",
+        _SlowPipeline(),
+    )
+    monkeypatch.setattr(_routes, "_STATS_CACHE", {
+        "snapshot": None,
+        "refreshing": False,
+        "thread_alive": True,  # no background thread in tests
+        "lock": threading.Lock(),
+    })
+
+    snap = _routes._ingestion_snapshot()
+
+    assert snap["available"] is False
+    assert _routes._STATS_CACHE["snapshot"] is None  # nothing scanned inline
+
+
+def test_snapshot_serves_cached_value_without_touching_pipeline(monkeypatch):
+    from api import integration_status_routes as _routes
+
+    sentinel = {"available": True, "active_streams": [], "app_stats": {"x": {}}}
+
+    class _MustNotBeCalled:
+        def get_ingestion_stats(self):
+            raise AssertionError("cache hit must not scan the pipeline")
+
+    monkeypatch.setattr(
+        "integrations.atom_communication_ingestion_pipeline.ingestion_pipeline",
+        _MustNotBeCalled(),
+    )
+    monkeypatch.setattr(_routes, "_STATS_CACHE", {
+        "snapshot": sentinel,
+        "refreshing": False,
+        "thread_alive": True,
+        "lock": threading.Lock(),
+    })
+
+    assert _routes._ingestion_snapshot() is sentinel

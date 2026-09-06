@@ -219,8 +219,14 @@ async def integration_ingest_item(
             external_id=external_id,
             extra_metadata={"ingested_via": "agent_jit", "integration_id": integration_id},
         )
+        # Shared semantics (core.auto_document_ingestion): unchanged
+        # re-ingests are success no-ops; unsupported formats and write
+        # failures must reach the agent as failures, not silent skips.
+        from core.auto_document_ingestion import interpret_ingest_result
+        interpreted = interpret_ingest_result(result)
         out = {
-            "success": result.get("status") in ("ok", "ingested", "skipped"),
+            "success": interpreted["success"],
+            "unchanged": interpreted["unchanged"],
             "result": result,
         }
         # Per-app feedback: agent pulls count for the integration too — the

@@ -777,3 +777,68 @@ async def test_long_file_ingests_as_chunk_family_and_refresh_replaces_it():
         assert "updated pricing" in stored["text"]
     finally:
         shutil.rmtree(store, ignore_errors=True)
+
+
+class TestInterpretIngestResult:
+    """The single shared interpretation of process_file_bytes results.
+
+    History: each drive service re-derived success/failure and diverged —
+    WorkDrive failed an unchanged re-ingest ("File ingest failed" in the
+    panel), Box/Dropbox/GDrive/OneDrive masked unsupported formats as
+    success. Semantics now live in interpret_ingest_result.
+    """
+
+    def test_ingested_is_success(self):
+        from core.auto_document_ingestion import interpret_ingest_result
+        out = interpret_ingest_result({"status": "ingested", "chars_ingested": 100})
+        assert out["success"] is True
+        assert out["unchanged"] is False
+        assert out["error"] is None
+
+    def test_unchanged_skip_is_success_noop(self):
+        from core.auto_document_ingestion import interpret_ingest_result
+        out = interpret_ingest_result({"status": "skipped", "reason": "unchanged"})
+        assert out["success"] is True
+        assert out["unchanged"] is True
+
+    def test_unsupported_and_write_failures_stay_failures(self):
+        from core.auto_document_ingestion import interpret_ingest_result
+        for result in (
+            {"status": "skipped", "reason": "no_text"},
+            {"status": "skipped", "reason": "no_file_extension"},
+            {"status": "skipped", "reason": "write_failed (store_error)"},
+            {"status": "error", "reason": "parse_failed"},
+            {"status": "error", "reason": "ingest_failed"},
+        ):
+            out = interpret_ingest_result(result)
+            assert out["success"] is False, result
+            assert result["reason"] in out["error"]
+
+    def test_unknown_shape_fails_closed(self):
+        from core.auto_document_ingestion import interpret_ingest_result
+        out = interpret_ingest_result({})
+        assert out["success"] is False
+
+
+class TestDriveServicesShareTheInterpreter:
+    """Drift guard: every storage service's file ingest must derive its
+    success/failure from the shared interpret_ingest_result, not re-derive
+    it locally (the per-service divergence was the original bug)."""
+
+    SERVICES = [
+        "integrations/zoho_workdrive_service.py",
+        "integrations/box_service.py",
+        "integrations/dropbox_service.py",
+        "integrations/google_drive_service.py",
+        "integrations/onedrive_service.py",
+    ]
+
+    def test_every_service_calls_the_shared_interpreter(self):
+        import pathlib
+        backend = pathlib.Path(__file__).resolve().parents[1]
+        for rel in self.SERVICES:
+            src = (backend / rel).read_text()
+            assert "interpret_ingest_result(result)" in src, (
+                f"{rel} re-derives ingest success locally — route it through "
+                "core.auto_document_ingestion.interpret_ingest_result"
+            )

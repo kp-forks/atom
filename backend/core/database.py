@@ -256,6 +256,32 @@ if poolclass is not None and not isinstance(poolclass, str):
 
 engine = create_engine(DATABASE_URL, **engine_kwargs)
 
+# SQLite durability/concurrency pragmas on EVERY connection (per-connection
+# settings must be re-applied per checkout). Evidence (Sep 6, 2026): the
+# ingestion re-walk wrote knowledge edges continuously while the DB sat in
+# the default journal mode — every writer took an exclusive lock and EVERY
+# reader endpoint blocked behind it ("app is just really slow in loading
+# anything"; sampled the live process: the event-loop thread itself parked
+# on a lock). WAL lets readers proceed while one writer works; NORMAL sync
+# is the recommended pairing (durable across app crashes, only vulnerable
+# to OS power loss); busy_timeout replaces spurious "database is locked".
+if "sqlite" in DATABASE_URL and ":memory:" not in DATABASE_URL:
+    from sqlalchemy import event as _sa_event
+
+    @_sa_event.listens_for(engine, "connect")
+    def _sqlite_pragmas(dbapi_connection, _record):
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            # busy_timeout: connect_args may already request a longer grace
+            # (timeout=20 → 20s). Never LOWER an existing setting.
+            current_ms = cursor.execute("PRAGMA busy_timeout").fetchone()[0]
+            if current_ms < 5000:
+                cursor.execute("PRAGMA busy_timeout=5000")
+        finally:
+            cursor.close()
+
 # Create session with production settings
 SessionLocal = sessionmaker(
     autocommit=False,

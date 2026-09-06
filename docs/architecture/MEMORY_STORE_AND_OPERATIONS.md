@@ -46,6 +46,35 @@ independent of the launch CWD.
 Relative paths passed to these env vars are anchored to `backend/` by
 `_resolve_local_db_path`; absolute and object-store URIs pass through.
 
+### Store layout: local (fresh default) vs external drive
+
+A fresh installation needs **no external drive** — the store is a plain
+local directory at `backend/data/atom_memory/` and every feature runs
+against it. External storage is an OPT-IN for machines that want heavy
+data off the internal disk:
+
+1. **Local (fresh default).** Nothing to configure. `restart_backend.sh`
+   keeps DB snapshots under `backend/data/backups/` (last 5) and stays
+   silent about external drives.
+2. **Drive-hosted via symlink.** Move `backend/data/atom_memory` onto a
+   mounted volume and symlink it back
+   (`atom_memory -> /Volumes/<drive>/…/atom_memory`). Optionally set
+   `ATOM_EXTERNAL_DRIVE=/Volumes/<drive>` so `restart_backend.sh` also
+   mirrors DB snapshots to `<drive>/atom-backups/` and
+   `scripts/drive_status.sh` knows the layout is drive-hosted.
+3. **Explicit env override.** Point `LANCEDB_URI` / `LANCEDB_URI_BASE` at
+   any path (or object-store URI) without symlinks.
+
+**Disconnect semantics (drive-hosted only):** the symlink dangles →
+construction/import still succeed (guarded mkdir), per-call memory
+operations fail loudly, `/api/health` reports `degraded`, and ingestion
+"pauses" — the poll loop rolls back fetch cursors when messages fail to
+store, so the window is re-walked and mail is ingested once the drive
+returns. Recovery on replug is automatic; **no restart needed**, and a
+local fallback store is deliberately NOT used (writes there would fork
+the store — see the divergence incident in `AGENTS.md`).
+
+
 **Rules for code:**
 - Never call `lancedb.connect()` with a raw relative path — route through
   `LanceDBHandler`, or reuse `_resolve_local_db_path`.
@@ -169,3 +198,33 @@ All candidates are PENDING; review them in Agent Studio → Auto-Dev Fixes
 banners + websocket `autodev_guidance` keep the supervisor informed.
 Verifier judges run with generous max_tokens (reasoning models truncate
 silently otherwise); shadow→enforce flips are eval-gated product decisions.
+
+## 6. Ingest idempotency: the store gate + duplicate-row heal (2026-09-06)
+
+Every write into `atom_communications` funnels through
+`LanceDBMemoryManager.ingest_communication` / `ingest_generic_record`
+(`ingest_batch` delegates). Two guards run there, both ownership-scoped
+(same-owner or unstamped rows block; a DIFFERENT owner's row never does —
+same contract as the poll-level `_dedup_messages`):
+
+1. **id guard** (`_stored_row_blocked`) — a row with the same
+   `(app_type, id)` already in the shared table blocks the write. Covers
+   the Sep 5 multi-process double-poll (seen-id map is per-process; the
+   store is the cross-process authority).
+2. **content-identity guard** (`_stored_content_blocked`) — same
+   `(app_type, sender, recipient, subject, body-hash, timestamp)` under a
+   DIFFERENT id also blocks (fetch paths that re-stamp ids). A genuine
+   re-send has a new timestamp and still ingests. Fails open: a hiccup
+   re-risks a duplicate, never loses mail.
+
+**Duplicate-row heal** (`_heal_duplicate_rows`, called from
+`initialize()`): once per store (marker row in `ingestion_metadata`,
+`app_type='__store_heal_comms_dedup_v1'`), scans rows with `_rowid`,
+groups by the same keys as the guards, deletes redundant rows via precise
+`_rowid IN (...)` deletes under `_store_surgery_lock`. Existing installs
+converge to fresh-install state; fresh installs pay one empty scan. Deletion
+mistakes are recoverable — maintenance keeps 7 days of table versions.
+
+Chat-side, the address lookup in `core/chat_tool_planner.py`
+(`_rank_address_hits`) additionally dedupes for PRESENTATION (re-ingested
+copies under re-stamped timestamps share content but not row ids).

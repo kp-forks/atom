@@ -554,7 +554,11 @@ class OneDriveService(IntegrationService):
                 external_id=file_id,
                 role=role,
             )
-            return {"success": True, "result": result}
+            # Shared semantics (core.auto_document_ingestion): unchanged
+            # re-ingests are success no-ops; unsupported formats and write
+            # failures must NOT be masked as success.
+            from core.auto_document_ingestion import interpret_ingest_result
+            return {**interpret_ingest_result(result), "result": result}
         except Exception as e:
             logger.error(f"Failed to ingest OneDrive file {file_id}: {e}")
             return {"success": False, "error": str(e)}

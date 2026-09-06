@@ -400,8 +400,10 @@ export default function ZohoWorkDriveIngestion() {
                 setIngestedFileIds(prev => new Set(prev).add(file.id));
                 notifyIngestionUpdated("zoho-workdrive");
                 toast({
-                    title: "Ingestion Successful",
-                    description: `Loaded ${file.name} into AI Employee working memory.`,
+                    title: data.unchanged ? "Already in Memory" : "Ingestion Successful",
+                    description: data.unchanged
+                        ? `${file.name} is already in AI Employee working memory — content unchanged since the last ingest.`
+                        : `Loaded ${file.name} into AI Employee working memory.`,
                 });
             } else {
                 throw new Error(data.error || 'Ingestion failed');

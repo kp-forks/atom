@@ -69,10 +69,13 @@ export function CanvasDataSection({
         setNotice(null);
         try {
             const res = await uploadCanvasData(canvasId, file);
-            if (res?.ingestion?.status === "ingested") {
+            const ing = res?.ingestion;
+            if (ing?.status === "ingested") {
                 setNotice({ kind: "ok", text: `Loaded “${file.name}” — ${res.role ? `${res.role} hire` : "agent"} can recall it.` });
+            } else if (ing?.status === "skipped" && (ing?.reason || ing?.status) === "unchanged") {
+                setNotice({ kind: "ok", text: `“${file.name}” is already in memory — content unchanged since the last ingest.` });
             } else {
-                setNotice({ kind: "info", text: `“${file.name}” was not ingested (${res?.ingestion?.reason || res?.ingestion?.status || "unsupported"}).` });
+                setNotice({ kind: "info", text: `“${file.name}” was not ingested (${ing?.reason || ing?.status || "unsupported"}).` });
             }
         } catch (e: any) {
             const body = e?.response?.data;
