@@ -415,6 +415,19 @@ async def lifespan(app: FastAPI):
     logger.info("ATOM Platform Starting (Hybrid Mode)")
     logger.info("=" * 60)
 
+    # Wedge forensics: `kill -USR1 <pid>` dumps every thread's Python stack
+    # into the log. When the event loop saturates, a C-level `sample` shows
+    # only interpreter frames — this names the exact coroutine/lock. Cheap,
+    # permanent, never fires on its own.
+    try:
+        import faulthandler
+        import signal as _signal
+
+        faulthandler.register(_signal.SIGUSR1, file=sys.stderr, all_threads=True)
+        logger.info("faulthandler: SIGUSR1 dumps thread stacks to stderr")
+    except Exception as fh_err:
+        logger.debug(f"faulthandler SIGUSR1 registration skipped: {fh_err}")
+
     # Wipe detector (incident 2026-09-04): a stray script emptied the dev DB
     # and the app re-seeded a blank world without complaint. Best-effort,
     # never blocks startup — see core/db_safety.py.

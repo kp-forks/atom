@@ -1,6 +1,7 @@
 """
 Chat Routes - API endpoints for the ATOM chat interface
 """
+import asyncio
 import logging
 import re
 import os
@@ -1367,7 +1368,7 @@ async def get_routing_stats(
         return {"enabled": enabled, "ema_enabled": ema_enabled, "stats": {"error": str(e)}}
 
 
-async def _office_draft(content: str, kind: str, title: str) -> Optional[tuple]:
+def _office_draft(content: str, kind: str, title: str) -> Optional[tuple]:
     """Materialize an office draft (excel table / slide outline / document)
     as a real file under ATOM_OFFICE_DIR and return the typed canvas
     payload ``(canvas_type, content, title)``; None when the kind has no
@@ -1513,7 +1514,7 @@ async def chat_draft_to_canvas(
         # office component.
         office_kind = {"office_word": "doc", "office_excel": "table",
                        "office_pptx": "slides"}[requested_type]
-        office = await _office_draft(content, office_kind, title)
+        office = await asyncio.to_thread(_office_draft, content, office_kind, title)
         if office:
             canvas_type, canvas_content, title = office
         else:
@@ -1536,7 +1537,7 @@ async def chat_draft_to_canvas(
     # markdown document path — the draft must still open. (Skipped when the
     # owner forced a type — their choice outranks the classifier.)
     if selected and requested_type == "auto" and canvas_type == "document":
-        office = await _office_draft(content, selected["kind"], title)
+        office = await asyncio.to_thread(_office_draft, content, selected["kind"], title)
         if office:
             canvas_type, canvas_content, title = office
         elif selected["kind"] == "code":
