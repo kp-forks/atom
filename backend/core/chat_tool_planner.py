@@ -1132,6 +1132,71 @@ async def _memory_search_block(
         return None
 
 
+async def _comm_per_term_retry(
+    svc: Any, service: str, action: str, query: str,
+    user_id: Optional[str], tenant_id: str, context: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    """Retry a communication live search ONE TERM AT A TIME when the
+    full-query search succeeded but returned nothing. Providers split into
+    two failure shapes — AND-semantics searches zero out when any common
+    token misses (slack/gmail), OR-ranking floods with junk (Graph; the
+    outlook leg handles that with its own per-term fan-out + weighted
+    merge). This is the bounded universal equivalent: ≤2 extra calls,
+    longest (=rarest) terms first, longest-term matches ranked first in the
+    merged block. Only the empty-success case reaches here — a hard
+    provider error is not something a retry can fix."""
+    try:
+        tokens = sorted(
+            {t for t in (query or "").split() if len(t) >= 3},
+            key=len, reverse=True,
+        )[:2]
+        if not tokens:
+            return None
+        try:
+            from integrations.universal_integration_service import SEARCHABLE_SERVICES
+        except Exception:
+            SEARCHABLE_SERVICES = frozenset()
+        merged: List[str] = []
+        for term in tokens:
+            try:
+                if action == "search" and service in SEARCHABLE_SERVICES:
+                    res = await svc.search(
+                        service, term,
+                        context={
+                            "user_id": user_id, "workspace_id": "default",
+                            "tenant_id": tenant_id,
+                            "agent_id": (context or {}).get("agent_id"),
+                        },
+                    )
+                else:
+                    res = await svc.execute(
+                        service, action, {"query": term, "limit": 8},
+                        context={
+                            "user_id": user_id, "workspace_id": "default",
+                            "tenant_id": tenant_id,
+                            "agent_id": (context or {}).get("agent_id"),
+                        },
+                    )
+            except Exception as term_err:
+                logger.debug(f"per-term retry failed ({service} '{term}'): {term_err}")
+                continue
+            data = res.get("data") if isinstance(res, dict) else None
+            if isinstance(res, dict) and res.get("status") == "success" and data:
+                merged.append(
+                    f"[matched '{term}'] {str(data)[:700]}"
+                )
+        if not merged:
+            return None
+        return _with_grounding(
+            f"LIVE TOOL RESULTS ({service}.{action}, query='{query}') — the "
+            f"full-query search returned nothing (provider term semantics); "
+            f"per-term retries matched:\n" + "\n".join(merged)
+        )
+    except Exception as retry_err:
+        logger.debug(f"per-term retry skipped: {retry_err}")
+        return None
+
+
 async def execute_tool_plan(
     plan: ToolPlan,
     user_id: Optional[str],
@@ -1489,6 +1554,17 @@ async def execute_tool_plan(
                         f"sender/recipient lookup over the workspace's own "
                         f"copies):\n" + "\n".join(mail_lines)
                     )
+                # Store has nothing either: an empty SUCCESS from an
+                # AND-semantics provider is usually one common token zeroing
+                # the query — retry the rarest terms individually before
+                # falling through to semantic memory (outlook's per-term
+                # technique, bounded).
+                if result.get("status") == "success":
+                    per_term = await _comm_per_term_retry(
+                        svc, service, action, query, user_id, tenant_id, context,
+                    )
+                    if per_term:
+                        return per_term
             # Empty live search is precisely where the model declares "I
             # don't have that file" about content that IS stored — the
             # ingested workspace indexes copies of these files and every

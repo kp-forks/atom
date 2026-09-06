@@ -239,3 +239,15 @@ messages under unrelated traffic), carry the dead-end when the live search
 returns nothing, and fire for ANY service once an email-address fragment
 appears in the query or recent history. `_ingested_mailbox_lines` is the
 shared helper; the outlook leg calls it too.
+
+**Per-term retries + connected-tool hint (2026-09-06, final pass):** two
+more outlook-only techniques generalized. (1) Comm services on the
+universal path now retry an empty-success live search ONE TERM AT A TIME
+(≤2 calls, longest terms first) — AND-semantics providers (slack, gmail)
+zero out when any common token misses; outlook already fanned out per-term
+against Graph's OR-ranking. Order on a comm dead-end: deterministic
+ingested mailbox → per-term retries → semantic memory → honest dead-end.
+(2) The memory-assembler header no longer hardcodes "the outlook tool":
+it names the user's ACTUALLY connected mailbox/chat tools
+(`_mailbox_tool_hint` via `get_connected_services`, neutral wording when
+none), so gmail-only agents are never told to use a tool they don't have.
