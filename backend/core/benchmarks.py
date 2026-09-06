@@ -29,7 +29,12 @@ MODEL_QUALITY_SCORES = {
     # conversational floor (85) regardless of their general aptitude.
     "deepseek/deepseek-v4-flash": 84,   # $0.08/$0.16 per M — see 0731 note
     "deepseek/deepseek-v4-pro": 96,     # $0.51/$1.02 per M — flagship
-    "qwen/qwen3-max": 94,               # $0.78/$3.90 per M
+    "qwen/qwen3-max": 90,               # $0.78/$3.90 per M — demoted from 94
+        # (Sept 6 tier battery: WORST composite of the vetted pool — failed
+        # olympiad-integer, capacity-math and a moderate arithmetic item,
+        # all deterministic-answer — see bpc_tier_benchmark_results.json.
+        # 90 keeps it ADVANCED-eligible as a fallback; value ranking already
+        # placed it last, so routing is unchanged — bookkeeping only.)
     "moonshotai/kimi-k2.5": 92,         # $0.60/$3.00 per M
     "minimax/minimax-m3": 89,           # $0.30/$1.20 per M — recall ✓
     "qwen/qwen3.7-flash": 76,           # $0.03/$0.13 per M — ultra-budget
@@ -46,6 +51,13 @@ MODEL_QUALITY_SCORES = {
     # behavior. Scores are capability-calibrated against external
     # benchmarks (Artificial Analysis / SWE-bench / Terminal-Bench coverage,
     # see commit message for sources) on the repo's 0-100 anchor scale.
+    # Cross-check: the repo's own tier battery
+    # (scripts/bpc_tier_battery.json + bpc_tier_benchmark.py — original
+    # tasks with deterministic checkers, per-BPC-tier) measured the whole
+    # vetted pool on Sept 6: with valid items the flash tier saturated the
+    # battery while qwen3-max (then 94) scored worst — see
+    # bpc_tier_benchmark_results.json. Re-run the battery before further
+    # score moves; upward deltas on a saturated battery are meaningless.
     "google/gemini-3-flash-preview": 93,  # $0.50/$3.00 per M — "frontier-
         # class at flash pricing": beats o3/GPT-5 on a medical accuracy
         # battery (PMC12894337), most cost-efficient frontier model

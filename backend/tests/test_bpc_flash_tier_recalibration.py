@@ -43,7 +43,7 @@ _POOL = {
     "openai/gpt-5-mini":               ("openrouter", 91, 1.125),
     "google/gemini-3-flash-preview":   ("openrouter", 93, 1.75),
     "minimax/minimax-m3":              ("openrouter", 89, 0.75),
-    "qwen/qwen3-max":                  ("openrouter", 94, 2.34),
+    "qwen/qwen3-max":                  ("openrouter", 90, 2.34),
 }
 
 
