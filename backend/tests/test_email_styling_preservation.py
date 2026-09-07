@@ -271,3 +271,64 @@ class TestHtmlReplyRoute:
         )
         assert ok is True
         assert calls.count("/me/messages/msg-9/reply") == 2
+
+
+class TestMinedSignaturePersistence:
+    @pytest.mark.asyncio
+    async def test_get_signature_persists_mined_html(self):
+        """Mining must PERSIST the styled variant: composer mounts and agent
+        sends then carry the user's real signature style everywhere without
+        relying on a manual save (user request, Sept 2026)."""
+        import time
+        from core import canvas_email_service as ces
+        from core.canvas_email_service import EmailCanvasService
+
+        saved = {}
+
+        class FakePrefs:
+            def __init__(self, db=None):
+                pass
+
+            def get_preference(self, user_id, ws, key):
+                return saved.get(key)
+
+            def set_preference(self, user_id, ws, key, value):
+                saved[key] = value
+
+        class FakeSvc:
+            async def get_user_profile(self, user_id):
+                return {"displayName": "Vipul Chopra", "mail": "v@wfs.ca"}
+
+            async def get_user_emails(self, user_id, folder="inbox", max_results=25, **kw):
+                assert folder == "sent"
+                return [{
+                    "body": {
+                        "contentType": "HTML",
+                        "content": (
+                            "<div>Hi Dana — shipment confirmed for Tuesday.</div>"
+                            + REALISTIC_OUTLOOK_SIGNATURE
+                        ),
+                    }
+                }]
+
+        import core.user_preference_service as ups
+        import integrations.outlook_service as osvc_mod
+
+        svc = EmailCanvasService.__new__(EmailCanvasService)
+        svc.db = None
+        ces._SIGNATURE_CACHE.pop("user-styled", None)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(ups, "UserPreferenceService", FakePrefs)
+            mp.setattr(osvc_mod, "OutlookService", FakeSvc)
+            result = await svc.get_signature("user-styled")
+
+            assert result["source"] == "integration"
+            assert result["signature_html"] and "font-family" in result["signature_html"]
+            assert saved.get(EmailCanvasService.SIGNATURE_HTML_KEY) == result["signature_html"]
+
+            # Cached path returns both variants without re-mining.
+            ces._SIGNATURE_CACHE.pop("user-styled", None)  # force the preference branch
+            cached = await svc.get_signature("user-styled")
+            assert cached["signature_html"] == result["signature_html"]
+        ces._SIGNATURE_CACHE.pop("user-styled", None)

@@ -156,3 +156,28 @@ def test_collect_team_signers_excludes_external_profile_people():
     assert "mark kellam" not in names
     if signers["primary"]:
         assert "kellam" not in str(signers["primary"].get("name", "")).lower()
+
+
+def test_identity_block_includes_styled_signature_html():
+    """The styled (raw HTML) signature must reach the drafting prompt so the
+    agent reproduces the user's real signature markup in the canvas body —
+    the plain-text variant alone is the style-losing shadow (Sept 2026)."""
+    from core.outbound_identity import identity_rule_block
+
+    block = identity_rule_block({
+        "name": "Rish M.",
+        "email": "rish@example.com",
+        "signature": "Regards, Rish M.",
+        "signature_html": '<div style="font-family:Aptos"><b><i>Rish M.</i></b></div>',
+    })
+    assert "Their default signature" in block
+    assert 'signature_html' in block.lower() or "exact HTML block" in block
+    assert "VERBATIM" in block
+    assert 'style="font-family:Aptos"' in block
+
+
+def test_identity_block_without_html_has_no_html_directive():
+    from core.outbound_identity import identity_rule_block
+
+    block = identity_rule_block({"name": "Rish M.", "signature": "Regards, Rish M."})
+    assert "exact HTML block" not in block

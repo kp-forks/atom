@@ -2391,6 +2391,13 @@ When users ask to fetch live data (like CRM leads), acknowledge that the integra
                         value = str((sig or {}).get("signature") or "").strip()
                         if value:
                             identity["signature"] = value
+                        # The STYLED variant (raw HTML — fonts, layout
+                        # tables, links) rides to the drafting prompt so the
+                        # agent reproduces the user's real signature markup
+                        # in the canvas body, not a plain-text shadow.
+                        sig_html = str((sig or {}).get("signature_html") or "").strip()
+                        if sig_html:
+                            identity["signature_html"] = sig_html
                     except Exception as sig_err:
                         logger.debug(f"canvas editor signature lookup skipped: {sig_err}")
         except Exception as e:

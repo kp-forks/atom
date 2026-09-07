@@ -125,7 +125,10 @@ export function CanvasPanel({ lastMessage, registerFlushBeforeSend }: CanvasHost
     };
 
     // Fetch the default signature once per composer mount; when it lands,
-    // append it to a body that doesn't already carry a sign-off.
+    // append it to a body that doesn't already carry a sign-off. The STYLED
+    // variant (signature_html — the real markup mined from sent mail: fonts,
+    // layout tables, links) is preferred; the composer body is an HTML
+    // string, so inserting the plain-text shadow loses the style.
     useEffect(() => {
         if (state?.component !== "email" || signatureFetchedRef.current) return;
         signatureFetchedRef.current = true;
@@ -134,10 +137,13 @@ export function CanvasPanel({ lastMessage, registerFlushBeforeSend }: CanvasHost
                 const { apiClient } = await import("@/lib/api");
                 const res = await apiClient.get("/api/canvas/email/signature");
                 const data = (res as any).data || res || {};
-                if (typeof data.signature === "string" && data.signature.trim()) {
-                    setEmailSignature(data.signature);
+                const styled = typeof data.signature_html === "string" && data.signature_html.trim()
+                    ? data.signature_html
+                    : (typeof data.signature === "string" ? data.signature : null);
+                if (styled && styled.trim()) {
+                    setEmailSignature(styled);
                     setSignatureSource(data.source || null);
-                    applySignature(data.signature);
+                    applySignature(styled);
                 }
             } catch {
                 // No signature configured — nothing to append.

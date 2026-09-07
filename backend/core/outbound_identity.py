@@ -75,6 +75,7 @@ def identity_rule_block(
     name = str(identity.get("name") or "").strip()
     email = str(identity.get("email") or "").strip()
     signature = str(identity.get("signature") or "").strip()
+    signature_html = str(identity.get("signature_html") or "").strip()
     if not name and not email:
         return ""
     who = name or email
@@ -110,6 +111,15 @@ def identity_rule_block(
         lines.append(
             "Their default signature — use verbatim when a signature is "
             "needed:\n" + signature[:400]
+        )
+    if signature_html:
+        # The STYLED signature (raw HTML): the canvas body is an HTML string,
+        # so the agent should reproduce THIS markup — fonts, layout tables,
+        # links — instead of re-inventing a plain-text sign-off.
+        lines.append(
+            "Their default signature is this exact HTML block — reproduce it "
+            "VERBATIM (all tags and inline styles intact) as the sign-off of "
+            "HTML email drafts:\n" + signature_html[:1200]
         )
     return "\n".join(lines)
 

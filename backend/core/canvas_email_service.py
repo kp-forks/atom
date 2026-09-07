@@ -1507,9 +1507,15 @@ class EmailCanvasService:
            API does not expose the client-side signature directly, but the
            integration stamps it on every sent message — so it is recovered
            from the sign-off block of the most recent sent email (cached;
-           the mailbox shouldn't be scanned per composer mount). The
-           integration value is NOT persisted: saving it (set_signature)
-           is a deliberate act.
+           the mailbox shouldn't be scanned per composer mount).
+
+        The MINED signature carries the user's real styling (fonts, layout
+        tables, links) and is persisted under ``email_signature_html`` so
+        composer inserts and agent sends stay styled everywhere (user
+        request, Sept 2026 — the old contract left it unpersisted, so the
+        style was lost the moment the preference stayed empty). The stored-
+        override branch is unchanged: saving via set_signature remains a
+        deliberate act, and the TEXT variant stays display-only.
         """
         from core.user_preference_service import UserPreferenceService
 
@@ -1574,6 +1580,16 @@ class EmailCanvasService:
 
         _SIGNATURE_CACHE[user_id] = (_time.time(), mined, mined_html)
         if mined or mined_html:
+            # Persist the styled variant (best-effort — a preference-store
+            # failure must never block the composer): agent sends and every
+            # composer mount then carry the user's real signature style
+            # without another mailbox scan.
+            try:
+                _prefs.set_preference(
+                    user_id, workspace_id, self.SIGNATURE_HTML_KEY, mined_html
+                )
+            except Exception as pref_err:
+                logger.debug(f"signature_html persist skipped: {pref_err}")
             return {
                 "success": True,
                 "signature": mined,
