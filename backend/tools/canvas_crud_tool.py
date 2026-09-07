@@ -244,8 +244,16 @@ async def update_canvas_content(
             if manual_retype:
                 canvas_type = requested_type or "generic"
                 details["type_pinned"] = True
+                details["content"] = content
             elif details.get("type_pinned"):
+                # Pinned: the canvas type is settled (no coercion/retype),
+                # but the caller's CONTENT must still land — skipping the
+                # merge silently turned every co-editor PUT on a pinned
+                # canvas (chat-created email drafts pin) into a no-op row
+                # that even shadowed newer content on recency (observed
+                # Sept 6: styled-table fix never reached the composer).
                 canvas_type = latest.canvas_type
+                details["content"] = content
             else:
                 if requested_type in ("", "generic") and latest.canvas_type:
                     canvas_type = latest.canvas_type
