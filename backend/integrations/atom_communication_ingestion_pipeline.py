@@ -92,44 +92,17 @@ async def _bounded_extraction(coro: Any) -> Any:
 
 _HTML_TAG_RE = _re_mod.compile(r"<(script|style)[^>]*>.*?</\1>|<[^>]+>", _re_mod.DOTALL | _re_mod.IGNORECASE)
 _HTML_WS_RE = _re_mod.compile(r"[ \t]*\n[ \t\n]*")
-# <a href> → [text](href) BEFORE tag-stripping: plain tag-stripping deleted
-# the href and kept only the anchor text, so ingested email lost every link
-# (agents could neither cite nor reproduce them — observed Sept 6).
-_HTML_ANCHOR_RE = _re_mod.compile(
-    r"<a\s[^>]*?href\s*=\s*[\"']([^\"']+)[\"'][^>]*>(.*?)</a>",
-    _re_mod.DOTALL | _re_mod.IGNORECASE,
+
+# Shared styling-preservation mechanism (core/communication_styling.py):
+# link recovery + capped raw-markup storage for EVERY communication app.
+# Module-level aliases keep the historical names importable from here.
+from core.communication_styling import (  # noqa: E402
+    MAX_RAW_CHARS as _MAX_INGEST_HTML_CHARS,
+    extract_raw_markup as _extract_raw_markup,
+    html_to_text as _shared_html_to_text,
+    preserve_links as _preserve_links_general,
+    preserve_links_in_html as _preserve_links_in_html,
 )
-# Style-bearing markup worth keeping the raw HTML for: signatures (styled
-# tables/fonts), data tables, images, links. Plain <p>text</p> bodies don't
-# justify the metadata size.
-_HTML_STYLE_MARKUP_RE = _re_mod.compile(
-    r"<(table|img)\b|style\s*=|\bclass\s*=|<a\s", _re_mod.IGNORECASE
-)
-_MAX_INGEST_HTML_CHARS = 64_000
-
-
-def _preserve_links_in_html(html_body: str) -> str:
-    """Rewrite <a href="URL">text</a> as [text](URL) so the href survives
-    the tag-stripping text conversion. Never raises."""
-    if not html_body or "<a" not in html_body.lower():
-        return html_body
-
-    def _anchor_text(inner: str) -> str:
-        text = _HTML_TAG_RE.sub("", inner)
-        text = _html_mod.unescape(text)
-        return _re_mod.sub(r"\s+", " ", text).strip()
-
-    try:
-        def _repl(m: "_re_mod.Match") -> str:
-            href, inner = m.group(1), m.group(2)
-            text = _anchor_text(inner)
-            if not text or text.lower() in ("click here", "here", "link"):
-                text = href
-            return f"[{text}]({href})"
-
-        return _HTML_ANCHOR_RE.sub(_repl, html_body)
-    except Exception:
-        return html_body
 
 
 def _format_graph_timestamp(dt: datetime) -> str:
@@ -261,18 +234,9 @@ def _extract_tables_from_html(html_body: str):
 
 
 def _html_to_text(html_body: str) -> str:
-    """Graph email bodies arrive as HTML; strip tags so FTS/vector search
-    indexes readable text instead of markup. Anchors are rewritten to
-    markdown links first (_preserve_links_in_html) so the href survives.
-    Never raises."""
-    if not html_body:
-        return ""
-    try:
-        text = _HTML_TAG_RE.sub("\n", _preserve_links_in_html(html_body))
-        text = _html_mod.unescape(text)
-        return _HTML_WS_RE.sub("\n", text).strip()
-    except Exception:
-        return html_body
+    """Tag-stripping text conversion with links preserved — delegated to the
+    shared styling module. Never raises."""
+    return _shared_html_to_text(html_body)
 
 
 def _html_to_text_with_tables(html_body: str):
@@ -4062,13 +4026,13 @@ class CommunicationIngestionPipeline:
             _email_tables: List[Dict] = []
             raw_html: Optional[str] = None
             if str(message_data.get("content_type", "")).lower() == "html":
-                # Style preservation: the tag-stripped text below is what
-                # search indexes, but signatures/table styling/links live
-                # only in the original markup. Keep a size-capped raw HTML
-                # copy in metadata so agents can reproduce the exact
-                # formatting (styled tables, the user's default signature).
-                if _HTML_STYLE_MARKUP_RE.search(content or ""):
-                    raw_html = content[:_MAX_INGEST_HTML_CHARS]
+                # Style preservation (shared mechanism): the tag-stripped
+                # text below is what search indexes, but signatures/table
+                # styling/links live only in the original markup. Keep a
+                # size-capped raw HTML copy in metadata so agents can
+                # reproduce the exact formatting.
+                _, raw_html = _extract_raw_markup(content, message_data,
+                                                  message_data.get("content_type"))
                 content, _email_tables = _html_to_text_with_tables(content)
             # Secrets redaction: email bodies are attacker-controlled text that
             # agents recall later. Reuse the document-path redactor so stored
@@ -4131,6 +4095,46 @@ class CommunicationIngestionPipeline:
         
         # Generic normalization for other apps
         else:
+            # Styling preservation for EVERY communication app (Slack, Teams,
+            # Telegram, Discord, Google Chat, SMS, …): recover platform link
+            # syntax into markdown links and keep style-bearing raw markup
+            # (HTML bodies, rich payloads) size-capped in metadata. Plain
+            # text passes through untouched — never-raise.
+            _raw_content = (
+                message_data.get("content")
+                or message_data.get("text")
+                or message_data.get("body")
+                or ""
+            )
+            _content_type = message_data.get("content_type")
+            _meta_key, _raw_markup = _extract_raw_markup(
+                _raw_content, message_data, _content_type)
+            if _raw_markup and _meta_key == "html_body":
+                # Rich variant present: derive the stored text from the
+                # markup so links survive (Teams emits html_content alongside
+                # a link-stripped plain text field).
+                _generic_content = _shared_html_to_text(_raw_markup)
+            else:
+                _generic_content = _preserve_links_general(
+                    _raw_content if isinstance(_raw_content, str) else str(_raw_content)
+                )
+
+            _generic_meta = message_data.get("metadata", {})
+            if _raw_markup:
+                if isinstance(_generic_meta, dict):
+                    _generic_meta = {**_generic_meta, _meta_key: _raw_markup}
+                else:
+                    # Some producers hand metadata over JSON-encoded; unwrap,
+                    # attach, re-encode — never raise, never lose the rest.
+                    try:
+                        import json as _json
+                        _parsed = _json.loads(_generic_meta) if isinstance(_generic_meta, str) else {}
+                        if isinstance(_parsed, dict):
+                            _parsed[_meta_key] = _raw_markup
+                            _generic_meta = _json.dumps(_parsed)
+                    except Exception:
+                        pass
+
             return {
                 "id": message_data.get("id", f"{app_type}_{datetime.now().isoformat()}"),
                 "app_type": app_type,
@@ -4143,14 +4147,9 @@ class CommunicationIngestionPipeline:
                 # "text", email-ish sources use "body", others "content".
                 # Without this, Telegram messages were stored with EMPTY
                 # content (and meaningless embeddings).
-                "content": (
-                    message_data.get("content")
-                    or message_data.get("text")
-                    or message_data.get("body")
-                    or ""
-                ),
+                "content": _generic_content,
                 "attachments": message_data.get("attachments", []),
-                "metadata": message_data.get("metadata", {}),
+                "metadata": _generic_meta,
                 "status": message_data.get("status", "active"),
                 "priority": message_data.get("priority", "normal"),
                 "tags": message_data.get("tags", [])
